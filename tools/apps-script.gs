@@ -34,6 +34,11 @@ function doPost(e) {
   lock.waitLock(10000);
   try {
     var current = readAll();
+    // Safety: never rewrite the tab from a partial read. If any row with an id could not be
+    // parsed, refuse to save rather than drop it.
+    if (current.__unreadable) {
+      return out({ ok: false, error: "unreadable rows: " + current.__unreadable.join(", ") });
+    }
     var merged = merge(current, incoming);
     writeAll(merged);
     return out({ ok: true, log: merged });
@@ -65,6 +70,7 @@ function readAll() {
   var log = {};
   if (last < 2) return log;
   var rows = sh.getRange(2, 1, last - 1, HEADER.length).getValues();
+  var unreadable = [];
   rows.forEach(function (r) {
     var id = String(r[0] || "").trim();
     if (!id) return;
@@ -73,19 +79,22 @@ function readAll() {
       log[id] = { del: true, u: updated };
       return;
     }
-    var hist = String(r[2] || "").split(",").map(function (s) { return s.trim(); }).filter(isDate);
+    // Column C may hold one date that Sheets converted to a date cell, or a comma list of text dates.
+    var hist = isDateObj(r[2]) ? [dateStr(r[2])]
+      : String(r[2] || "").split(",").map(function (s) { return dateStr(s); }).filter(isDate);
     var lastDate = isDate(dateStr(r[1])) ? dateStr(r[1]) : (hist.length ? hist[hist.length - 1] : "");
-    if (!lastDate) return;
+    if (!lastDate) { unreadable.push(id); return; }
     if (hist.indexOf(lastDate) < 0) hist.push(lastDate);
-    hist.sort();
+    hist = uniq(hist).sort();
     log[id] = { last: lastDate, history: hist.slice(-12), u: updated || (lastDate + "T00:00:00Z") };
   });
+  if (unreadable.length) log.__unreadable = unreadable;
   return log;
 }
 
 function writeAll(log) {
   var sh = sheet();
-  var ids = Object.keys(log).sort();
+  var ids = Object.keys(log).filter(function (k) { return k.indexOf("__") !== 0; }).sort();
   var rows = ids.map(function (id) {
     var v = log[id];
     if (v.del) return [id, "", "", v.u || "", "TRUE"];
@@ -93,7 +102,11 @@ function writeAll(log) {
   });
   var lastRow = sh.getLastRow();
   if (lastRow > 1) sh.getRange(2, 1, lastRow - 1, HEADER.length).clearContent();
-  if (rows.length) sh.getRange(2, 1, rows.length, HEADER.length).setValues(rows);
+  if (rows.length) {
+    var range = sh.getRange(2, 1, rows.length, HEADER.length);
+    range.setNumberFormat("@");   // plain text: stop Sheets turning dates into date cells
+    range.setValues(rows);
+  }
 }
 
 function merge(current, incoming) {
@@ -123,13 +136,17 @@ function stamp(v) { return v && v.u ? String(v.u) : ""; }
 
 function isDate(s) { return typeof s === "string" && /^\d{4}-\d{2}-\d{2}$/.test(s); }
 
+// Date cells from getValues() are not reliably `instanceof Date` in Apps Script, so duck-type them.
+function isDateObj(x) { return !!x && typeof x === "object" && typeof x.getTime === "function" && !isNaN(x.getTime()); }
+
+// A date cell is midnight in the spreadsheet's time zone; format it there to get back the typed date.
 function dateStr(x) {
-  if (x instanceof Date && !isNaN(x)) return Utilities.formatDate(x, "UTC", "yyyy-MM-dd");
+  if (isDateObj(x)) return Utilities.formatDate(x, SpreadsheetApp.getActiveSpreadsheet().getSpreadsheetTimeZone(), "yyyy-MM-dd");
   return String(x || "").trim();
 }
 
 function isoOf(x) {
-  if (x instanceof Date && !isNaN(x)) return x.toISOString();
+  if (isDateObj(x)) return x.toISOString();
   var s = String(x || "").trim();
   return /^\d{4}-\d{2}-\d{2}T/.test(s) ? s : "";
 }
