@@ -23,7 +23,7 @@
  * typo in the Sheet can never cause rows to be dropped.
  */
 
-var VERSION = 8;
+var VERSION = 9;
 var CADENCES = ["weekly", "monthly", "bimonthly", "quarterly", "semiannual", "annual"];
 var SCAN_DAYS = 40;             // default look-back for the daily / on-demand scan
 var SCAN_MIN_GAP_MS = 5 * 60 * 1000;
@@ -566,7 +566,10 @@ function scanGmail(opts) {
 
   targets.forEach(function (billId) {
     var bill = bills[billId];
-    var ids = gmailSearch("from:(" + bill.sender + ") " + window, perBill);
+    // sender is normally a domain/address for from:(...). A value starting with "q:" is a raw
+    // Gmail query, for chatty senders such as card alerts: q:from:chase.com subject:NETFLIX
+    var base = /^q:/i.test(bill.sender) ? bill.sender.slice(2).trim() : "from:(" + bill.sender + ")";
+    var ids = gmailSearch(base + " " + window, perBill);
     ids.forEach(function (id) {
       var key = "e-" + id;
       if (payments[key]) { dup++; return; }          // includes tombstones: a deleted payment stays deleted
