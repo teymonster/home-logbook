@@ -18,11 +18,29 @@
 
 var SHEET = "log";
 var HEADER = ["id", "last", "history", "updated", "deleted"];
+var VERSION = 2;
+
+// Run this from the editor (select "debugRead", press Run) and open the Execution log to see
+// exactly what the script reads from the tab. Nothing is written.
+function debugRead() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  Logger.log("spreadsheet: " + ss.getName() + " | tabs: " + ss.getSheets().map(function (s) { return s.getName() + "(" + s.getLastRow() + " rows)"; }).join(", "));
+  var sh = sheet();
+  Logger.log("reading tab '" + sh.getName() + "', last row " + sh.getLastRow());
+  if (sh.getLastRow() >= 2) {
+    var first = sh.getRange(2, 1, 1, HEADER.length).getValues()[0];
+    Logger.log("row 2 raw: " + JSON.stringify(first) + " | types: " + first.map(function (x) { return Object.prototype.toString.call(x); }).join(", "));
+  }
+  var log = readAll();
+  var ids = Object.keys(log).filter(function (k) { return k.indexOf("__") !== 0; });
+  Logger.log("parsed " + ids.length + " tasks: " + ids.join(", "));
+  if (log.__unreadable) Logger.log("UNREADABLE: " + log.__unreadable.join(", "));
+}
 
 function doGet(e) {
   var token = e && e.parameter && e.parameter.token;
   if (!authorized(token)) return out({ ok: false, error: "unauthorized" });
-  return out({ ok: true, log: readAll() });
+  return out({ ok: true, version: VERSION, log: readAll() });
 }
 
 function doPost(e) {
