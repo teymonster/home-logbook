@@ -23,7 +23,7 @@
  * typo in the Sheet can never cause rows to be dropped.
  */
 
-var VERSION = 3;
+var VERSION = 4;
 var CADENCES = ["weekly", "monthly", "quarterly", "semiannual", "annual"];
 var SCAN_DAYS = 40;             // default look-back for the daily / on-demand scan
 var SCAN_MIN_GAP_MS = 5 * 60 * 1000;
@@ -341,12 +341,28 @@ function parseLooseDate(str) {
 
 /* ------------------------------------------------------------------ gmail: access */
 
+// Gmail API quota is per minute per user. Pace calls and back off on quota errors.
+var gmailCalls = 0;
+function gmailCall(fn) {
+  for (var attempt = 1; ; attempt++) {
+    try {
+      gmailCalls++;
+      if (gmailCalls % 20 === 0) Utilities.sleep(600);
+      return fn();
+    } catch (err) {
+      var msg = String(err);
+      if (attempt >= 6 || !/quota|rate ?limit|backend ?error|too many/i.test(msg)) throw err;
+      Utilities.sleep(2000 * attempt);
+    }
+  }
+}
+
 function gmailSearch(q, max) {
   var ids = [], token = null, res;
   do {
     var params = { q: q, maxResults: Math.min(max - ids.length, 100) };
     if (token) params.pageToken = token;
-    res = Gmail.Users.Messages.list("me", params);
+    res = gmailCall(function () { return Gmail.Users.Messages.list("me", params); });
     (res.messages || []).forEach(function (m) { ids.push(m.id); });
     token = res.nextPageToken;
   } while (token && ids.length < max);
@@ -367,11 +383,11 @@ function metaOf(m) {
 }
 
 function gmailMeta(id) {
-  return metaOf(Gmail.Users.Messages.get("me", id, { format: "metadata", metadataHeaders: ["From", "Subject", "Date"] }));
+  return metaOf(gmailCall(function () { return Gmail.Users.Messages.get("me", id, { format: "metadata", metadataHeaders: ["From", "Subject", "Date"] }); }));
 }
 
 function gmailFull(id) {
-  var m = Gmail.Users.Messages.get("me", id, { format: "full" });
+  var m = gmailCall(function () { return Gmail.Users.Messages.get("me", id, { format: "full" }); });
   var meta = metaOf(m);
   meta.body = bodyText(m.payload).slice(0, 20000);
   return meta;
