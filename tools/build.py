@@ -48,16 +48,26 @@ def main():
     if n != 1:
         die("expected exactly one 'App version:' stamp in src, found %d" % n)
 
+    admin = ""
     if os.path.exists(SYNCFILE):
         cfg = json.load(open(SYNCFILE))
-        url, token = cfg.get("url", ""), cfg.get("token", "")
+        url, token, admin = cfg.get("url", ""), cfg.get("token", ""), cfg.get("admin", "")
         if not url.startswith("https://script.google.com/") or len(token) < 16:
             die(".sync.json needs an Apps Script /exec url and a token of 16+ chars")
         if token in open(SRC).read():
             die("the sync token is hard-coded in src/index.html; use the __SYNC_TOKEN__ placeholder")
         if "__SYNC_URL__" not in html or "__SYNC_TOKEN__" not in html:
             die("src/index.html has no __SYNC_URL__/__SYNC_TOKEN__ placeholders")
+        # The admin token (email access) must never reach the page in any form.
+        if admin and admin == token:
+            die("the admin token must differ from the app token")
+        if admin and admin in html:
+            die("the admin token appears in src/index.html; remove it")
+        if "__ADMIN" in html or "ADMIN_TOKEN" in html:
+            die("src/index.html mentions the admin token; the page must not know it exists")
         html = html.replace("__SYNC_URL__", url).replace("__SYNC_TOKEN__", token)
+        if admin and admin in html:
+            die("the admin token leaked into the built page")
         sync = "on"
     else:
         print("build.py: WARNING no .sync.json; the app will run in 'this device only' mode", file=sys.stderr)

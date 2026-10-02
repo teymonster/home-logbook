@@ -21,9 +21,31 @@ GitHub Pages rebuilds from `docs/` on `main` within about a minute.
 |---|---|
 | `src/index.html` | the app, plaintext |
 | `.bloom-passphrase` | one line; the page's passphrase |
-| `.sync.json` | `{"url": "<Apps Script /exec URL>", "token": "<secret>"}`; optional, enables Google Sheet sync |
+| `.sync.json` | `{"url": "<Apps Script /exec URL>", "token": "<app token>", "admin": "<admin token>"}`; `url`+`token` enable Google Sheet sync and are injected into the page; `admin` is used only from this machine and is never injected |
 
 `.staticrypt.json` (the salt) **is** committed. Regenerating it logs every remembered device out.
+
+## Google Sheet backend
+
+`tools/apps-script.gs` is the web app bound to the Sheet; `tools/appsscript.json` is its manifest
+(Gmail read-only scope + the Gmail advanced service). Script properties: `TOKEN` (app) and
+`ADMIN_TOKEN` (owner only, must differ). Tabs `log`, `bills`, `payments` are created on first use.
+
+A daily trigger (`installTrigger`, run once from the editor) scans the last 40 days of Gmail for
+each bill with a `sender` and writes payment rows. The app's Refresh button runs the same scan on
+demand (at most once per 5 minutes).
+
+### Admin ops (never from the page)
+
+```sh
+url=$(python3 -c 'import json;print(json.load(open(".sync.json"))["url"])')
+admin=$(python3 -c 'import json;print(json.load(open(".sync.json"))["admin"])')
+curl -sL "$url?admin=$admin&op=discover&months=12" | python3 -m json.tool        # who bills me, how often
+curl -sL "$url?admin=$admin&op=peek&id=<gmailId>" | python3 -m json.tool          # one email's text
+curl -sL "$url?admin=$admin&op=scan&months=12&bill=<id>&dry=1" | python3 -m json.tool   # backfill preview
+```
+
+Bill rows can also be written with the app token: `POST {token, bills:{id:{...,u}}}`.
 
 ## Devices
 
