@@ -23,7 +23,7 @@
  * typo in the Sheet can never cause rows to be dropped.
  */
 
-var VERSION = 4;
+var VERSION = 5;
 var CADENCES = ["weekly", "monthly", "quarterly", "semiannual", "annual"];
 var SCAN_DAYS = 40;             // default look-back for the daily / on-demand scan
 var SCAN_MIN_GAP_MS = 5 * 60 * 1000;
@@ -54,7 +54,8 @@ function doGet(e) {
     // Owner-only operations. Never consult the app token here.
     if (!adminAuthorized(p.admin)) return out({ ok: false, error: "unauthorized" });
     try {
-      if (p.op === "discover") return out(discoverGmail(clampInt(p.months, 1, 24, 12), clampInt(p.max, 50, 600, 400)));
+      if (p.op === "discover") return out(discoverGmail(clampInt(p.months, 1, 36, 12), clampInt(p.max, 50, 600, 400), gmailDate(p.after), gmailDate(p.before)));
+      if (p.op === "raw") return out(rawMessage(String(p.id || "")));
       if (p.op === "scan") return out(scanGmail({ months: p.months ? clampInt(p.months, 1, 24, 12) : null, days: SCAN_DAYS, bill: p.bill || null, dry: p.dry === "1" }));
       if (p.op === "peek") return out(peekMessage(String(p.id || "")));
       return out({ ok: false, error: "unknown op" });
@@ -409,8 +410,33 @@ function bodyText(payload) {
   return stripHtml(html.join("\n"));
 }
 
+var lastDecodeError = "";
 function decodeB64(data) {
-  try { return Utilities.newBlob(Utilities.base64DecodeWebSafe(data)).getDataAsString("UTF-8"); } catch (e) { return ""; }
+  var str = String(data || "");
+  try {
+    var bytes = Utilities.base64DecodeWebSafe(str);
+    var txt = Utilities.newBlob(bytes).getDataAsString("UTF-8");
+    if (txt) return txt;
+  } catch (e) { lastDecodeError = "websafe: " + e; }
+  try {
+    var std = str.replace(/-/g, "+").replace(/_/g, "/");
+    while (std.length % 4) std += "=";
+    return Utilities.newBlob(Utilities.base64Decode(std)).getDataAsString("UTF-8");
+  } catch (e2) { lastDecodeError += " | std: " + e2; return ""; }
+}
+
+// Admin diagnostic: the MIME skeleton of one message and any decode error, no body text.
+function rawMessage(id) {
+  if (!id) return { ok: false, error: "id required" };
+  var m = gmailCall(function () { return Gmail.Users.Messages.get("me", id, { format: "full" }); });
+  function skel(p) {
+    if (!p) return null;
+    return { mimeType: p.mimeType, hasData: !!(p.body && p.body.data), size: p.body ? p.body.size : null,
+             dataSample: p.body && p.body.data ? String(p.body.data).slice(0, 24) : "", parts: (p.parts || []).map(skel) };
+  }
+  lastDecodeError = "";
+  var text = bodyText(m.payload);
+  return { ok: true, id: id, subject: headerOf(m, "Subject"), skeleton: skel(m.payload), decoded: text.length, decodeError: lastDecodeError, sample: text.slice(0, 300) };
 }
 
 function stripHtml(h) {
@@ -434,13 +460,15 @@ function senderDomain(from) {
 
 /* ------------------------------------------------------------------ gmail: discovery (admin) */
 
-function discoverGmail(months, max) {
+// after/before: "YYYY/MM/DD" Gmail search dates; when given they replace the newer_than window.
+function discoverGmail(months, max, after, before) {
+  var window = (after || before) ? ((after ? "after:" + after + " " : "") + (before ? "before:" + before + " " : "")) : "newer_than:" + months + "m ";
   var queries = [
-    "newer_than:" + months + "m -category:social -category:forums (subject:(bill OR statement OR payment OR receipt OR invoice OR autopay OR \"auto pay\" OR \"payment confirmation\" OR due OR premium OR renewal OR \"amount due\") OR \"amount due\" OR \"payment received\" OR \"thank you for your payment\")"
+    window + "-category:social -category:forums (subject:(bill OR statement OR payment OR receipt OR invoice OR autopay OR \"auto pay\" OR \"payment confirmation\" OR due OR premium OR renewal OR \"amount due\") OR \"amount due\" OR \"payment received\" OR \"thank you for your payment\")"
   ];
   var bills = readAll("bills");
   var senders = Object.keys(bills).filter(function (k) { return k.indexOf("__") !== 0 && !bills[k].del && bills[k].sender; }).map(function (k) { return bills[k].sender; });
-  if (senders.length) queries.push("newer_than:" + months + "m from:(" + senders.join(" OR ") + ")");
+  if (senders.length) queries.push(window + "from:(" + senders.join(" OR ") + ")");
 
   var seen = {}, ids = [];
   queries.forEach(function (q) {
@@ -472,7 +500,12 @@ function discoverGmail(months, max) {
              medianGapDays: med, cadenceGuess: cadenceGuess(med), amounts: g.amounts, subjects: g.subjects, ids: g.ids };
   }).sort(function (a, b) { return b.count - a.count; }).slice(0, 80);
 
-  return { ok: true, months: months, scanned: ids.length, truncated: ids.length >= max, senders: list };
+  return { ok: true, months: months, window: window.trim(), scanned: ids.length, truncated: ids.length >= max, senders: list };
+}
+
+function gmailDate(x) {
+  var m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s(x));
+  return m ? m[1] + "/" + m[2] + "/" + m[3] : "";
 }
 
 function cadenceGuess(med) {
