@@ -23,7 +23,7 @@
  * typo in the Sheet can never cause rows to be dropped.
  */
 
-var VERSION = 7;
+var VERSION = 8;
 var CADENCES = ["weekly", "monthly", "bimonthly", "quarterly", "semiannual", "annual"];
 var SCAN_DAYS = 40;             // default look-back for the daily / on-demand scan
 var SCAN_MIN_GAP_MS = 5 * 60 * 1000;
@@ -56,7 +56,9 @@ function doGet(e) {
     try {
       if (p.op === "discover") return out(discoverGmail(clampInt(p.months, 1, 36, 12), clampInt(p.max, 50, 600, 400), gmailDate(p.after), gmailDate(p.before)));
       if (p.op === "raw") return out(rawMessage(String(p.id || "")));
-      if (p.op === "scan") return out(scanGmail({ months: p.months ? clampInt(p.months, 1, 24, 12) : null, days: SCAN_DAYS, bill: p.bill || null, dry: p.dry === "1" }));
+      if (p.op === "search") return out(searchGmail(String(p.q || ""), clampInt(p.max, 1, 300, 100)));
+      if (p.op === "scan") return out(scanGmail({ months: p.months ? clampInt(p.months, 1, 36, 12) : null, days: SCAN_DAYS, bill: p.bill || null, dry: p.dry === "1",
+                                                   after: gmailDate(p.after), before: gmailDate(p.before), max: clampInt(p.max, 10, 300, 60) }));
       if (p.op === "peek") return out(peekMessage(String(p.id || "")));
       return out({ ok: false, error: "unknown op" });
     } catch (err) {
@@ -525,6 +527,17 @@ function cadenceGuess(med) {
   return "irregular";
 }
 
+// Admin: arbitrary Gmail search, headers + snippet only (no bodies). For finding billers.
+function searchGmail(q, max) {
+  if (!q) return { ok: false, error: "q required" };
+  var ids = gmailSearch(q, max);
+  var items = ids.map(function (id) {
+    var m = gmailMeta(id);
+    return { id: id, date: m.date, from: m.from, subject: m.subject, amount: extractAmount(m.subject + " " + m.snippet, null), snippet: m.snippet.slice(0, 140) };
+  });
+  return { ok: true, q: q, count: items.length, truncated: ids.length >= max, items: items };
+}
+
 function peekMessage(id) {
   if (!id) return { ok: false, error: "id required" };
   var m = gmailFull(id);
@@ -546,11 +559,14 @@ function scanGmail(opts) {
     return k.indexOf("__") !== 0 && !b.del && b.active && b.sender && (!opts.bill || k === opts.bill);
   });
   var added = [], updatedBills = [], unmatched = [], warnings = [], dup = 0, checked = 0, billsDirty = false;
-  var window = opts.months ? "newer_than:" + opts.months + "m" : "newer_than:" + days + "d";
+  var window = (opts.after || opts.before)
+    ? ((opts.after ? "after:" + opts.after + " " : "") + (opts.before ? "before:" + opts.before : "")).trim()
+    : (opts.months ? "newer_than:" + opts.months + "m" : "newer_than:" + days + "d");
+  var perBill = opts.max || 60;
 
   targets.forEach(function (billId) {
     var bill = bills[billId];
-    var ids = gmailSearch("from:(" + bill.sender + ") " + window, 60);
+    var ids = gmailSearch("from:(" + bill.sender + ") " + window, perBill);
     ids.forEach(function (id) {
       var key = "e-" + id;
       if (payments[key]) { dup++; return; }          // includes tombstones: a deleted payment stays deleted
