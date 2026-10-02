@@ -23,7 +23,7 @@
  * typo in the Sheet can never cause rows to be dropped.
  */
 
-var VERSION = 5;
+var VERSION = 6;
 var CADENCES = ["weekly", "monthly", "quarterly", "semiannual", "annual"];
 var SCAN_DAYS = 40;             // default look-back for the daily / on-demand scan
 var SCAN_MIN_GAP_MS = 5 * 60 * 1000;
@@ -412,6 +412,10 @@ function bodyText(payload) {
 
 var lastDecodeError = "";
 function decodeB64(data) {
+  // The Gmail advanced service hands body.data over as a byte array already; raw API JSON is base64url text.
+  if (Array.isArray(data)) {
+    try { return Utilities.newBlob(data).getDataAsString("UTF-8"); } catch (e0) { lastDecodeError = "bytes: " + e0; return ""; }
+  }
   var str = String(data || "");
   try {
     var bytes = Utilities.base64DecodeWebSafe(str);
