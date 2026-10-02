@@ -23,8 +23,8 @@
  * typo in the Sheet can never cause rows to be dropped.
  */
 
-var VERSION = 6;
-var CADENCES = ["weekly", "monthly", "quarterly", "semiannual", "annual"];
+var VERSION = 7;
+var CADENCES = ["weekly", "monthly", "bimonthly", "quarterly", "semiannual", "annual"];
 var SCAN_DAYS = 40;             // default look-back for the daily / on-demand scan
 var SCAN_MIN_GAP_MS = 5 * 60 * 1000;
 
@@ -291,7 +291,7 @@ function normalizePayment(v) {
 /* ------------------------------------------------------------------ gmail: classification */
 
 var PAY_RE  = /payment (received|confirmation|confirmed|processed|posted|successful|complete|was made|has been made)|thank you for your payment|thanks for your payment|we received your payment|we('ve| have) received your|you(?:'ve| have)? paid|has been paid|auto\s?pay(?:ment)? (processed|complete|posted|was made)|receipt for|payment receipt|your receipt|order confirmation|charged|successfully charged/i;
-var BILL_RE = /statement (is )?(ready|available)|bill is (ready|available|due)|new (bill|statement|invoice)|your (bill|invoice|statement)|amount due|is due|upcoming (payment|bill|charge)|auto\s?pay(?:ment)? (is )?scheduled|will be (charged|debited|drafted)|premium (notice|due)|renewal|payment reminder|payment due/i;
+var BILL_RE = /statement (is )?(ready|available)|bill is (ready|available|due)|new (bill|statement|invoice)|your (bill|invoice|statement)|amount due|is due|upcoming (payment|bill|charge)|auto\s?pay(?:ment)? (is )?scheduled|will be (charged|debited|drafted)|premium (notice|due)|renewal|payment reminder|payment due|payment scheduled|payment coming up/i;
 var CONTEXT_RE = /(?:amount|total|payment|paid|charged|due|balance)[^$\n]{0,40}\$\s?(\d{1,3}(?:,\d{3})*(?:\.\d{2})?)/i;
 var FIRST_DOLLAR_RE = /\$\s?(\d{1,3}(?:,\d{3})*(?:\.\d{2})?)/;
 var DUE_DATE_RE = /due(?: date| on| by)?[^\n]{0,25}?((?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\.? \d{1,2},? \d{4}|\d{1,2}\/\d{1,2}\/\d{2,4})/i;
@@ -406,8 +406,11 @@ function bodyText(payload) {
     }
     (p.parts || []).forEach(walk);
   })(payload);
-  if (plain.length) return plain.join("\n");
-  return stripHtml(html.join("\n"));
+  // Some senders ship a junk text/plain part (Comcast's says "undefined"); use HTML when plain is trivial.
+  var plainText = plain.join("\n").trim();
+  if (plainText.length > 40) return plainText;
+  var htmlText = stripHtml(html.join("\n"));
+  return htmlText.length > plainText.length ? htmlText : plainText;
 }
 
 var lastDecodeError = "";
