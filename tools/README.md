@@ -43,7 +43,13 @@ admin=$(python3 -c 'import json;print(json.load(open(".sync.json"))["admin"])')
 curl -sL "$url?admin=$admin&op=discover&months=12" | python3 -m json.tool        # who bills me, how often
 curl -sL "$url?admin=$admin&op=peek&id=<gmailId>" | python3 -m json.tool          # one email's text
 curl -sL "$url?admin=$admin&op=scan&months=12&bill=<id>&dry=1" | python3 -m json.tool   # backfill preview
+curl -sL "$url?admin=$admin&op=search&max=100&q=$(python3 -c 'import urllib.parse;print(urllib.parse.quote("from:chase.com subject:NETFLIX newer_than:12m"))')"   # any Gmail search, headers only
+curl -sL "$url?admin=$admin&op=raw&id=<gmailId>"                                           # MIME skeleton + decode diagnostics
 ```
+
+A bill's `sender` is normally a domain for `from:(…)`. For chatty senders (card alerts) use a
+raw query instead: `q:from:chase.com subject:"transaction with" subject:(NETFLIX)`. Scans cap
+at 60 messages per bill per run (`max=` up to 300 for admin backfills).
 
 Bill rows can also be written with the app token: `POST {token, bills:{id:{...,u}}}`.
 
