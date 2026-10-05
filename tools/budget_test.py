@@ -209,6 +209,19 @@ class CombinedAndTips(unittest.TestCase):
         self.assertEqual(tomb, {cid: {"del": True}})
 
 
+class LateAlert(unittest.TestCase):
+    def test_late_alert_takes_over_the_statement_row_and_its_tag(self):
+        Matching.setUp(self)
+        row = csvrow("2026-09-29", "ZELLE: PAT EXAMPLE", 150.0, account="usaa")
+        cid = B.csv_id("usaa", row, 1)
+        sh = sheet(transactions={cid: dict(tx("2026-09-29", "ZELLE: PAT EXAMPLE", 150.0, account="usaa", source="csv", csv=True, gmailId="", tag="necessary", note="weekly")),
+                                 "e-9": tx("2026-09-29", "Zelle to Pat Example", 150.0, account="usaa", source="zelle", gmailId="9")})
+        out, _, _, tomb = B.Matcher(sh, {"rows": {cid: dict(row, account="usaa")}, "coverage": {"usaa": ["2026-01-01", "2026-10-05"]}}, self.r).run()
+        self.assertEqual(list(out), ["e-9"])
+        self.assertEqual((out["e-9"]["tag"], out["e-9"]["note"], out["e-9"]["csv"], out["e-9"].get("carry")), ("necessary", "weekly", True, True))
+        self.assertEqual(tomb, {cid: {"del": True}})
+
+
 class Diff(unittest.TestCase):
     def test_only_changed_non_owned_fields_count(self):
         cur = {"e-1": tx("2026-09-01", "M", 1.0, category="dining", tag="necessary", suggested="unnecessary")}
