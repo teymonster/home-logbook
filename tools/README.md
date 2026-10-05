@@ -65,6 +65,8 @@ push, an empty one is filled on the next push.
 python3 tools/budget.py backfill --months 12   # admin: harvest Chase alerts, Zelle sends, Amazon/DoorDash/Uber receipts, month by month
 python3 tools/budget.py run                    # pull → ingest budget/statements/ → match → push → report (budget/report.md)
 python3 tools/budget.py push --dry             # preview what would be written
+python3 tools/budget.py accept-suggestions     # tag = suggested on every untagged row, suggestion cleared
+python3 tools/budget.py rescan-receipts        # re-read mis-parsed Amazon receipt emails via the peek op
 node tools/script_test.js && python3 tools/budget_test.py
 ```
 

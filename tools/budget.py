@@ -859,7 +859,7 @@ class Matcher:
                 sug = "skip"
             if t["amount"] < 0 and t["category"] not in ("income", "transfer"):
                 sug = sug or ""  # credits net against their category; no nag
-            t["suggested"] = tag_ok(sug)
+            t["suggested"] = "" if t.get("tag") else tag_ok(sug)   # a tagged row needs no suggestion
             t.pop("_rcpt", None); t.pop("_status", None); t.pop("_orderId", None)
             t.setdefault("tag", ""); t.setdefault("note", ""); t.setdefault("detail", ""); t.setdefault("billId", ""); t.setdefault("gmailId", "")
 
@@ -954,6 +954,27 @@ def cmd_push(args):
     if budget:
         sheet_post({"budget": budget})
         print("  budget rows seeded: %s" % ", ".join(sorted(budget)))
+    cmd_pull(args)
+
+
+def cmd_accept_suggestions(args):
+    """Move every suggestion into the tag column (rows with no tag yet) and clear the suggestion."""
+    guard_repo()
+    sheet = cmd_pull(args)
+    tx = live(sheet["transactions"])
+    stamp = now_iso()
+    rows = {}
+    for k, t in tx.items():
+        if not t.get("tag") and t.get("suggested") in TAGS:
+            rows[k] = dict(t, tag=t["suggested"], suggested="", u=stamp)
+    by_tag = collections.Counter(r["tag"] for r in rows.values())
+    print("accept: %d rows → %s%s" % (len(rows), dict(by_tag), " (DRY)" if args.dry else ""))
+    if args.dry or not rows:
+        return
+    ids = list(rows)
+    for i in range(0, len(ids), BATCH):
+        sheet_post({"transactions": {k: rows[k] for k in ids[i:i + BATCH]}})
+        print("  %d-%d written" % (i + 1, min(i + BATCH, len(ids))))
     cmd_pull(args)
 
 
@@ -1202,11 +1223,12 @@ def main(argv=None):
     p = sub.add_parser("push"); p.add_argument("--dry", action="store_true")
     rp = sub.add_parser("report"); rp.add_argument("--months", type=int, default=12)
     rs = sub.add_parser("rescan-receipts"); rs.add_argument("--dry", action="store_true")
+    ac = sub.add_parser("accept-suggestions"); ac.add_argument("--dry", action="store_true")
     rn = sub.add_parser("run"); rn.add_argument("--months", type=int, default=12); rn.add_argument("--dry", action="store_true")
     args = ap.parse_args(argv)
     guard_repo()
     {"pull": cmd_pull, "backfill": cmd_backfill, "ingest": cmd_ingest, "match": cmd_match, "push": cmd_push, "report": cmd_report, "run": cmd_run,
-     "rescan-receipts": cmd_rescan_receipts}[args.cmd](args)
+     "rescan-receipts": cmd_rescan_receipts, "accept-suggestions": cmd_accept_suggestions}[args.cmd](args)
 
 
 if __name__ == "__main__":
