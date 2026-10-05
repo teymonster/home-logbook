@@ -824,7 +824,7 @@ var BUDGET_KINDS = {
 var CHASE_ALERT_RE = /^You made a \$([\d,]+\.\d{2}) transaction with (.+?)\.?$/i;
 var ZELLE_RE = /You sent\s+\$([\d,]+\.\d{2})\s+to\s+(.+?)\s+with Zelle/i;   // \s: USAA puts a no-break space after the amount
 // Order blocks: "Order # 111-… Grand Total: 22.44 USD", "Order #: D01-… *Grand Total: $3.99", "Order # 111-… * Item Quantity: 1 Total 27.8 USD"
-var AMZ_ORDER_RE = /Order\s*#\s*:?\s*([A-Z0-9]{3}-\d{7}-\d{7})([\s\S]{0,900}?)(?:Grand Total|Order Total|Total)\s*:?\s*\$?\s*([\d,]+(?:\.\d{1,2})?)\s*(?:USD)?/gi;
+var AMZ_ORDER_RE = /Order\s*#\s*:?\s*([A-Z0-9]{3}-\d{7}-\d{7})([\s\S]{0,2500}?)(?:Grand Total|Order Total|Total)\s*:?\s*\$?\s*([\d,]+(?:\.\d{1,2})?)\s*(?:USD)?/gi;
 var AMZ_ITEM_RE = /\*\s*([^*\n]{2,120}?)\s+Quantity:\s*(\d+)/g;
 var AMZ_REFUND_RE = /\$([\d,]+\.\d{2}) (?:will be|has been|was) (?:credited|refunded|issued)|(?:refund(?: total)?|total refund)\*?\s*:?\s*\$([\d,]+\.\d{2})/i;
 var DD_ITEM_RE = /(\d+)x\s+([^$]{2,90}?)\s+\$(\d+\.\d{2})/g;
@@ -846,7 +846,7 @@ function parseZelle(subject, body) {
 function parseAmazon(meta, body) {
   var subj = s(meta.subject), out = [], m;
   // Return logistics (drop-off, return request, pickup) are not money; the refund email is.
-  if (/dropoff|drop-off|return request|return received|pickup|pick-up|label/i.test(subj) && !/refund/i.test(subj)) return [];
+  if (/dropoff|drop[- ]off|return (request|received|summary|confirmation)|printing information|pickup|pick-up|label|refund ineligible/i.test(subj) && !/refund issued/i.test(subj)) return [];
   if (/refund/i.test(subj)) {
     var rm = AMZ_REFUND_RE.exec(body), om = /orderId=([A-Z0-9]{3}-\d{7}-\d{7})/.exec(body);
     var item = (/refund issued for (.+?)\.*$/i.exec(subj) || [])[1] || "";

@@ -485,7 +485,7 @@ def cmd_backfill(args):
 
 # ------------------------------------------------------------------------------------ receipt repair
 
-AMZ_ORDER_PY = re.compile(r"Order\s*#\s*:?\s*([A-Z0-9]{3}-\d{7}-\d{7})([\s\S]{0,900}?)(?:Grand Total|Order Total|Total)\s*:?\s*\$?\s*([\d,]+(?:\.\d{1,2})?)\s*(?:USD)?", re.I)
+AMZ_ORDER_PY = re.compile(r"Order\s*#\s*:?\s*([A-Z0-9]{3}-\d{7}-\d{7})([\s\S]{0,2500}?)(?:Grand Total|Order Total|Total)\s*:?\s*\$?\s*([\d,]+(?:\.\d{1,2})?)\s*(?:USD)?", re.I)
 AMZ_ITEM_PY = re.compile(r"\*\s*([^*\n]{2,120}?)\s+Quantity:\s*(\d+)")
 AMZ_REFUND_PY = re.compile(r"\$([\d,]+\.\d{2}) (?:will be|has been|was) (?:credited|refunded|issued)|(?:refund(?: total)?|total refund)\*?\s*:?\s*\$([\d,]+\.\d{2})", re.I)
 
@@ -493,7 +493,7 @@ AMZ_REFUND_PY = re.compile(r"\$([\d,]+\.\d{2}) (?:will be|has been|was) (?:credi
 def parse_amazon_py(subject, body):
     """Python twin of the script's parseAmazon, for repairing receipts the deployed version mis-read."""
     subj = subject.strip()
-    if re.search(r"dropoff|drop-off|return request|return received|pickup|pick-up|label", subj, re.I) and not re.search(r"refund", subj, re.I):
+    if re.search(r"dropoff|drop[- ]off|return (request|received|summary|confirmation)|printing information|pickup|pick-up|label|refund ineligible", subj, re.I) and not re.search(r"refund issued", subj, re.I):
         return []
     if re.search(r"refund", subj, re.I):
         rm = AMZ_REFUND_PY.search(body)
