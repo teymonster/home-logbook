@@ -65,11 +65,28 @@ const g = {
     get: (_me, id, opts) => {
       const m = gmailDb[id];
       const msg = { id, internalDate: String(m.internalDate), snippet: m.snippet || "", payload: { headers: [{ name: "From", value: m.from }, { name: "Subject", value: m.subject }] } };
-      if (opts.format === "full") msg.payload.parts = [{ mimeType: "text/plain", body: { data: Buffer.from(m.body || "").toString("base64url") } }];
+      if (opts.format === "full") {
+        msg.payload.parts = [{ mimeType: "text/plain", body: { data: Buffer.from(m.body || "").toString("base64url") } }];
+        (m.attachments || []).forEach((a, i) => msg.payload.parts.push({ mimeType: a.mimeType, filename: a.filename, body: { size: a.bytes.length, attachmentId: id + "-att" + i } }));
+      }
       return msg;
     },
+    Attachments: { get: (_me, id, attId) => ({ data: Buffer.from(gmailDb[id].attachments[Number(attId.split("-att")[1])].bytes).toString("base64url") }) },
   } } },
+  DriveApp: { getRootFolder: () => fakeFolder(driveRoot) },
 };
+// Minimal Drive: a folder is { name, folders: [], files: [] }; createFile returns the file record.
+let driveRoot = { name: "My Drive", folders: [], files: [] };
+function iter(arr) { let i = 0; return { hasNext: () => i < arr.length, next: () => arr[i++] }; }
+function fakeFolder(f) {
+  return {
+    getFoldersByName: (n) => iter(f.folders.filter((x) => x.name === n).map(fakeFolder)),
+    createFolder: (n) => { const nf = { name: n, folders: [], files: [] }; f.folders.push(nf); return fakeFolder(nf); },
+    getFilesByName: (n) => iter(f.files.filter((x) => x.name === n && !x.trashed).map((x) => ({ getUrl: () => "url:" + x.name, setTrashed: (t) => { x.trashed = t; } }))),
+    createFile: (blob) => { const rec = { name: blob.name, bytes: blob.bytes, mimeType: blob.mimeType }; f.files.push(rec); return { getUrl: () => "url:" + rec.name }; },
+  };
+}
+g.Utilities.newBlob = (bytes, mimeType, name) => ({ getDataAsString: () => Buffer.from(bytes).toString("utf8"), bytes, mimeType, name });
 Object.assign(global, g);
 // Load the script into the global scope (top-level function declarations become globals).
 (0, eval)(src);
@@ -79,7 +96,40 @@ function test(name, fn) {
   try { fn(); passed++; console.log("ok   " + name); }
   catch (e) { console.log("FAIL " + name + "\n     " + (e && e.stack ? e.stack.split("\n").slice(0, 12).join("\n     ") : e)); process.exitCode = 1; }
 }
-function reset() { for (const k of Object.keys(tabs)) delete tabs[k]; gmailDb = {}; gmailQueries = []; delete props.LAST_BUDGET_SCAN; }
+function reset() { for (const k of Object.keys(tabs)) delete tabs[k]; gmailDb = {}; gmailQueries = []; delete props.LAST_BUDGET_SCAN; driveRoot = { name: "My Drive", folders: [], files: [] }; }
+
+// ---- gmail → drive ---------------------------------------------------------------------------
+test("fileAttachments saves PDFs into a folder path, skips duplicates, dry run writes nothing", () => {
+  reset();
+  const pdf = Array.from(Buffer.from("%PDF-1.4 synthetic invoice"));
+  gmailDb.m1 = { from: "Shop <email.notification@example.com>", subject: "Your Invoice is Ready", internalDate: Date.UTC(2025, 4, 28), body: "invoice i27625 attached",
+                 attachments: [{ filename: "Invoice_i27625.pdf", mimeType: "application/pdf", bytes: pdf }, { filename: "logo.png", mimeType: "image/png", bytes: [1, 2, 3] }] };
+  const dry = fileAttachments("m1", "299 Bloom/2025", { dry: true });
+  assert.deepStrictEqual([dry.ok, dry.dry, dry.saved.length, dry.saved[0].name, dry.created], [true, true, 1, "Invoice_i27625.pdf", []]);
+  assert.strictEqual(driveRoot.folders.length, 0, "dry run must not create folders");
+
+  const wet = fileAttachments("m1", "299 Bloom/2025", {});
+  assert.deepStrictEqual(wet.created, ["299 Bloom", "299 Bloom/2025"]);
+  assert.deepStrictEqual(wet.saved.map((s) => [s.name, s.size]), [["Invoice_i27625.pdf", pdf.length]]);
+  const folder = driveRoot.folders[0].folders[0];
+  assert.deepStrictEqual([folder.name, folder.files.length, folder.files[0].mimeType], ["2025", 1, "application/pdf"]);
+  assert.deepStrictEqual(Array.from(folder.files[0].bytes), pdf, "bytes round-trip through base64url");
+
+  const again = fileAttachments("m1", "299 Bloom/2025", {});
+  assert.deepStrictEqual([again.saved.length, again.skipped.length, again.skipped[0].reason, again.created], [0, 1, "exists", []]);
+  assert.strictEqual(folder.files.length, 1);
+
+  const over = fileAttachments("m1", "299 Bloom/2025", { overwrite: true });
+  assert.strictEqual(over.saved.length, 1);
+  assert.deepStrictEqual(folder.files.map((f) => !!f.trashed), [true, false]);
+
+  const all = fileAttachments("m1", "299 Bloom/2025", { all: true });
+  assert.deepStrictEqual(all.saved.map((s) => s.name), ["logo.png"], "all=1 adds the non-PDF; the PDF is skipped as existing");
+  assert.strictEqual(fileAttachments("", "x", {}).ok, false);
+  assert.strictEqual(fileAttachments("m1", "x", { dry: true }).saved.length, 1);
+  gmailDb.m2 = { from: "a@b", subject: "no files", internalDate: Date.UTC(2025, 4, 28), body: "", attachments: [] };
+  assert.strictEqual(fileAttachments("m2", "299 Bloom/2025", {}).note, "no matching attachments");
+});
 
 // ---- parsers --------------------------------------------------------------------------------
 test("parseChaseAlert reads amount and merchant", () => {

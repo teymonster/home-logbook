@@ -89,6 +89,8 @@ function doGet(e) {
       if (p.op === "scan") return out(scanGmail({ months: p.months ? clampInt(p.months, 1, 36, 12) : null, days: SCAN_DAYS, bill: p.bill || null, dry: p.dry === "1",
                                                    after: gmailDate(p.after), before: gmailDate(p.before), max: clampInt(p.max, 10, 300, 60) }));
       if (p.op === "peek") return out(peekMessage(String(p.id || "")));
+      if (p.op === "file") return out(fileAttachments(String(p.id || ""), String(p.folder || DEFAULT_FILE_FOLDER),
+                                                      { dry: p.dry === "1", all: p.all === "1", overwrite: p.overwrite === "1" }));
       if (p.op === "setup") { setupBudgetTabs(); return out({ ok: true, setup: BUDGET_NAMES }); }
       if (p.op === "budgetscan") return out(scanBudget({ kind: s(p.kind) || "all", dry: p.dry === "1", after: gmailDate(p.after), before: gmailDate(p.before),
                                                          days: p.days ? clampInt(p.days, 1, 400, SCAN_DAYS) : null, max: clampInt(p.max, 10, 300, 300) }));
@@ -753,6 +755,78 @@ function peekMessage(id) {
   if (!id) return { ok: false, error: "id required" };
   var m = gmailFull(id);
   return { ok: true, id: m.id, from: m.from, subject: m.subject, date: m.date, body: m.body.slice(0, 4000) };
+}
+
+/* ------------------------------------------------------------------ gmail → drive: file attachments (admin) */
+
+// op=file&id=<gmailId>[&folder=299 Bloom/2025][&dry=1][&all=1][&overwrite=1]
+// Saves a message's attachments (PDFs unless all=1) into the Drive folder named by path from My Drive.
+// Missing folders along the path are created. A file whose name already exists in the folder is
+// skipped unless overwrite=1 (which trashes the old copy first). Needs the Drive scope in appsscript.json.
+var DEFAULT_FILE_FOLDER = "299 Bloom/2025";
+
+function fileAttachments(id, folderPath, opts) {
+  opts = opts || {};
+  if (!id) return { ok: false, error: "id required" };
+  var m = gmailCall(function () { return Gmail.Users.Messages.get("me", id, { format: "full" }); });
+  var meta = metaOf(m);
+  var atts = listAttachments(m.payload).filter(function (a) {
+    return opts.all || /\.pdf$/i.test(a.filename) || a.mimeType === "application/pdf";
+  });
+  var result = { ok: true, id: id, date: meta.date, from: meta.from, subject: meta.subject, folder: folderPath, dry: !!opts.dry,
+                 saved: [], skipped: [], created: [] };
+  if (!atts.length) { result.note = "no matching attachments"; return result; }
+  var folder = opts.dry ? null : driveFolderByPath(folderPath, result.created);
+  atts.forEach(function (a) {
+    var name = a.filename || ("attachment-" + id + (a.mimeType === "application/pdf" ? ".pdf" : ""));
+    if (opts.dry) { result.saved.push({ name: name, size: a.size, mimeType: a.mimeType, dry: true }); return; }
+    var existing = folder.getFilesByName(name);
+    if (existing.hasNext()) {
+      if (!opts.overwrite) { result.skipped.push({ name: name, reason: "exists", url: existing.next().getUrl() }); return; }
+      while (existing.hasNext()) existing.next().setTrashed(true);
+    }
+    var bytes = a.data ? decodeB64Bytes(a.data)
+      : decodeB64Bytes(gmailCall(function () { return Gmail.Users.Messages.Attachments.get("me", id, a.attachmentId); }).data);
+    var file = folder.createFile(Utilities.newBlob(bytes, a.mimeType || "application/pdf", name));
+    result.saved.push({ name: name, size: bytes.length, url: file.getUrl() });
+  });
+  return result;
+}
+
+// Every part with a filename, plus its attachmentId (or inline data for small parts).
+function listAttachments(payload) {
+  var found = [];
+  (function walk(p) {
+    if (!p) return;
+    if (p.filename && p.body && (p.body.attachmentId || p.body.data)) {
+      found.push({ filename: String(p.filename), mimeType: String(p.mimeType || "").toLowerCase(),
+                   size: p.body.size || 0, attachmentId: p.body.attachmentId || null, data: p.body.data || null });
+    }
+    (p.parts || []).forEach(walk);
+  })(payload);
+  return found;
+}
+
+// Base64url (or already-decoded byte array) → bytes, for binary attachments.
+function decodeB64Bytes(data) {
+  if (Array.isArray(data)) return data;
+  var str = String(data || "");
+  try { return Utilities.base64DecodeWebSafe(str); } catch (e) { /* fall through */ }
+  var std = str.replace(/-/g, "+").replace(/_/g, "/");
+  while (std.length % 4) std += "=";
+  return Utilities.base64Decode(std);
+}
+
+// "A/B/C" under My Drive; creates what is missing and records each created path in `created`.
+function driveFolderByPath(path, created) {
+  var folder = DriveApp.getRootFolder(), sofar = [];
+  String(path || "").split("/").map(function (x) { return x.trim(); }).filter(Boolean).forEach(function (name) {
+    sofar.push(name);
+    var it = folder.getFoldersByName(name);
+    if (it.hasNext()) folder = it.next();
+    else { folder = folder.createFolder(name); if (created) created.push(sofar.join("/")); }
+  });
+  return folder;
 }
 
 /* ------------------------------------------------------------------ gmail: scan */

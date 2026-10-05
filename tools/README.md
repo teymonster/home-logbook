@@ -45,7 +45,12 @@ curl -sL "$url?admin=$admin&op=peek&id=<gmailId>" | python3 -m json.tool        
 curl -sL "$url?admin=$admin&op=scan&months=12&bill=<id>&dry=1" | python3 -m json.tool   # backfill preview
 curl -sL "$url?admin=$admin&op=search&max=100&q=$(python3 -c 'import urllib.parse;print(urllib.parse.quote("from:chase.com subject:NETFLIX newer_than:12m"))')"   # any Gmail search, headers only
 curl -sL "$url?admin=$admin&op=raw&id=<gmailId>"                                           # MIME skeleton + decode diagnostics
+curl -sL "$url?admin=$admin&op=file&id=<gmailId>&dry=1"                                    # list a message's PDF attachments
+curl -sL "$url?admin=$admin&op=file&id=<gmailId>&folder=299%20Bloom/2025"                  # save them into that Drive folder (skips names already there; &overwrite=1 replaces; &all=1 for non-PDFs)
 ```
+
+`op=file` needs the `https://www.googleapis.com/auth/drive` scope in `appsscript.json` (the folder
+lookup by name has to see existing folders, which the narrower `drive.file` scope cannot).
 
 A bill's `sender` is normally a domain for `from:(…)`. For chatty senders (card alerts) use a
 raw query instead: `q:from:chase.com subject:"transaction with" subject:(NETFLIX)`. Scans cap
