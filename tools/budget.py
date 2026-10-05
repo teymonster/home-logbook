@@ -28,7 +28,6 @@ import subprocess
 import sys
 import time
 import urllib.parse
-import urllib.request
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BUDGET = os.path.join(ROOT, "budget")
@@ -90,16 +89,24 @@ def cfg(admin=False):
 
 
 def http_json(url, data=None, timeout=330):
-    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"} if data else {})
+    """GET (or POST json) through curl: it follows the Apps Script redirect, honours the sandbox proxy and
+    enforces --max-time, which a plain urllib socket timeout did not when the proxy swallowed a connection."""
+    cmd = ["curl", "-sS", "-L", "--max-time", str(int(timeout)), "--retry", "0"]
+    if data is not None:
+        cmd += ["-H", "Content-Type: application/json", "--data-binary", "@-"]
+    cmd.append(url)
     for attempt in range(1, 4):
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as r:
-                raw = r.read().decode("utf-8")
-            return json.loads(raw)
-        except (json.JSONDecodeError, urllib.error.URLError, TimeoutError) as e:
-            if attempt == 3:
-                die("endpoint error: %s" % e)
-            time.sleep(5 * attempt)
+            r = subprocess.run(cmd, input=data, capture_output=True, timeout=timeout + 15)
+            raw = r.stdout.decode("utf-8", "replace")
+            if r.returncode == 0 and raw.lstrip().startswith("{"):
+                return json.loads(raw)
+            err = r.stderr.decode("utf-8", "replace").strip() or ("non-JSON response: " + raw[:80].replace("\n", " "))
+        except (subprocess.TimeoutExpired, OSError, json.JSONDecodeError) as e:
+            err = str(e)
+        if attempt == 3:
+            die("endpoint error: %s" % err)
+        time.sleep(5 * attempt)
 
 
 def sheet_get():
