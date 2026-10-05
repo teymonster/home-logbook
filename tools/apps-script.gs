@@ -1,12 +1,21 @@
 /**
- * Home Logbook — Google Apps Script web app (v3).
+ * Home Logbook — Google Apps Script web app (v10).
  *
- * Bound to the "Home Logbook progress" Sheet. Three tabs, created on first use:
- *   log       id | last | history | updated | deleted                    (task tick-offs)
- *   bills     id | name | category | cadence | dueDay | dueMonths | amount | autopay | sender |
- *             subjectPaid | subjectBill | amountRegex | payUrl | notes | active |
- *             lastBillAmount | lastBillDue | updated | deleted
- *   payments  id | billId | date | amount | source | gmailId | subject | updated | deleted
+ * Bound to the "Home Logbook progress" Sheet. Tabs, created on first use:
+ *   log          id | last | history | updated | deleted                    (task tick-offs)
+ *   bills        id | name | category | cadence | dueDay | dueMonths | amount | autopay | sender |
+ *                subjectPaid | subjectBill | amountRegex | payUrl | notes | active |
+ *                lastBillAmount | lastBillDue | updated | deleted
+ *   payments     id | billId | date | amount | source | gmailId | subject | updated | deleted
+ *   transactions id | date | merchant | amount | account | category | suggested | tag | note | detail |
+ *                billId | source | csv | gmailId | updated | deleted     (budget: every charge)
+ *   receipts     id | kind | date | merchant | total | orderId | categories | items | last4 |
+ *                gmailId | txId | updated | deleted                       (budget: parsed emails)
+ *   budget       category | target | note | updated | deleted             (budget: monthly targets)
+ *
+ * The three budget tabs are not part of the app's normal sync: GET returns them only with
+ * &budget=1 and POST merges them only when present. Columns listed in a collection's "owned"
+ * list (tag, note, category, target) are Beck's: a filled Sheet cell survives every push.
  *
  * Setup (once):
  *   1. Script properties: TOKEN (the app's token) and ADMIN_TOKEN (different; only used from
@@ -23,7 +32,7 @@
  * typo in the Sheet can never cause rows to be dropped.
  */
 
-var VERSION = 9;
+var VERSION = 10;
 var CADENCES = ["weekly", "monthly", "bimonthly", "quarterly", "semiannual", "annual"];
 var SCAN_DAYS = 40;             // default look-back for the daily / on-demand scan
 var SCAN_MIN_GAP_MS = 5 * 60 * 1000;
@@ -42,9 +51,29 @@ var COLLECTIONS = {
   payments: {
     header: ["id", "billId", "date", "amount", "source", "gmailId", "subject", "updated", "deleted"],
     fromRow: paymentFromRow, toRow: paymentToRow, normalize: normalizePayment
+  },
+  transactions: {
+    header: ["id", "date", "merchant", "amount", "account", "category", "suggested", "tag", "note", "detail",
+             "billId", "source", "csv", "gmailId", "updated", "deleted"],
+    fromRow: txFromRow, toRow: txToRow, normalize: normalizeTx,
+    owned: ["category", "tag", "note"], order: byDateDesc, setup: setupTransactionsTab
+  },
+  receipts: {
+    header: ["id", "kind", "date", "merchant", "total", "orderId", "categories", "items", "last4", "gmailId", "txId", "updated", "deleted"],
+    fromRow: receiptFromRow, toRow: receiptToRow, normalize: normalizeReceipt,
+    order: byDateDesc, setup: setupReceiptsTab
+  },
+  budget: {
+    header: ["category", "target", "note", "updated", "deleted"],
+    fromRow: budgetFromRow, toRow: budgetToRow, normalize: normalizeBudget,
+    owned: ["target", "note"], setup: setupBudgetTab
   }
 };
-var NAMES = ["log", "bills", "payments"];
+var NAMES = ["log", "bills", "payments"];                 // the app's sync set (unchanged)
+var BUDGET_NAMES = ["transactions", "receipts", "budget"]; // read with &budget=1, written when sent
+var TAGS = ["necessary", "unnecessary", "frivolous", "skip"];
+var ACCOUNTS = ["chase", "usaa"];
+var RECEIPT_KINDS = ["amazon", "amazon-refund", "doordash", "doordash-order", "uber"];
 
 /* ------------------------------------------------------------------ web app */
 
@@ -60,6 +89,8 @@ function doGet(e) {
       if (p.op === "scan") return out(scanGmail({ months: p.months ? clampInt(p.months, 1, 36, 12) : null, days: SCAN_DAYS, bill: p.bill || null, dry: p.dry === "1",
                                                    after: gmailDate(p.after), before: gmailDate(p.before), max: clampInt(p.max, 10, 300, 60) }));
       if (p.op === "peek") return out(peekMessage(String(p.id || "")));
+      if (p.op === "budgetscan") return out(scanBudget({ kind: s(p.kind) || "all", dry: p.dry === "1", after: gmailDate(p.after), before: gmailDate(p.before),
+                                                         days: p.days ? clampInt(p.days, 1, 400, SCAN_DAYS) : null, max: clampInt(p.max, 10, 300, 300) }));
       return out({ ok: false, error: "unknown op" });
     } catch (err) {
       return out({ ok: false, error: String(err) });
@@ -68,6 +99,10 @@ function doGet(e) {
   if (!authorized(p.token)) return out({ ok: false, error: "unauthorized" });
   var resp = { ok: true, version: VERSION, lastScan: getProp("LAST_SCAN") || "" };
   for (var i = 0; i < NAMES.length; i++) resp[NAMES[i]] = readAll(NAMES[i]);
+  if (p.budget === "1") {
+    resp.lastBudgetScan = getProp("LAST_BUDGET_SCAN") || "";
+    for (var j = 0; j < BUDGET_NAMES.length; j++) resp[BUDGET_NAMES[j]] = readAll(BUDGET_NAMES[j]);
+  }
   return out(resp);
 }
 
@@ -103,6 +138,17 @@ function doPost(e) {
     }
     var resp = { ok: true, version: VERSION, lastScan: getProp("LAST_SCAN") || "" };
     for (i = 0; i < NAMES.length; i++) resp[NAMES[i]] = merged[NAMES[i]];
+    // Budget collections: merged and written only when the client sent them (the page never does).
+    // body.quiet asks for row counts instead of the echo, since these tabs run to thousands of rows.
+    for (i = 0; i < BUDGET_NAMES.length; i++) {
+      name = BUDGET_NAMES[i];
+      if (!body[name] || typeof body[name] !== "object") continue;
+      var cur = readAll(name);
+      if (cur.__unreadable) return out({ ok: false, error: "unreadable " + name + " rows: " + cur.__unreadable.join(", ") });
+      var m = merge(name, cur, body[name]);
+      writeAll(name, m);
+      resp[name] = body.quiet ? { rows: Object.keys(m).length } : m;
+    }
     if (scanInfo) resp.scan = scanInfo;
     return out(resp);
   } finally {
@@ -128,9 +174,10 @@ function out(obj) {
 
 function sheet(name) {
   var ss = SpreadsheetApp.getActiveSpreadsheet();
-  var sh = ss.getSheetByName(name);
-  if (!sh) sh = ss.insertSheet(name);
+  var sh = ss.getSheetByName(name), created = false;
+  if (!sh) { sh = ss.insertSheet(name); created = true; }
   if (sh.getLastRow() === 0) sh.appendRow(COLLECTIONS[name].header);
+  if (created && COLLECTIONS[name].setup) COLLECTIONS[name].setup(sh);
   return sh;
 }
 
@@ -154,6 +201,7 @@ function writeAll(name, obj) {
   var c = COLLECTIONS[name];
   var sh = sheet(name);
   var ids = Object.keys(obj).filter(function (k) { return k.indexOf("__") !== 0; }).sort();
+  if (c.order) ids.sort(function (a, b) { return c.order(obj[a], obj[b]) || (a < b ? -1 : a > b ? 1 : 0); });
   var rows = ids.map(function (id) { return c.toRow(id, obj[id]); });
   var lastRow = sh.getLastRow();
   if (lastRow > 1) sh.getRange(2, 1, lastRow - 1, c.header.length).clearContent();
@@ -165,7 +213,7 @@ function writeAll(name, obj) {
 }
 
 function merge(name, current, incoming) {
-  var normalize = COLLECTIONS[name].normalize;
+  var c = COLLECTIONS[name], normalize = c.normalize;
   var merged = {}, id;
   for (id in current) if (id.indexOf("__") !== 0) merged[id] = current[id];
   for (id in incoming) {
@@ -173,9 +221,20 @@ function merge(name, current, incoming) {
     var v = normalize(incoming[id]);
     if (!v) continue;
     var cur = merged[id];
-    if (!cur || stamp(v) > stamp(cur)) merged[id] = v;   // strict: a tie keeps the Sheet's row
+    if (cur && stamp(v) <= stamp(cur)) continue;        // strict: a tie keeps the Sheet's row
+    // Sheet-owned columns (Beck's tags, notes, overrides): a filled cell is never overwritten
+    // by a push, however new its stamp. Clearing the cell in the Sheet lets the next push fill it.
+    if (cur && !cur.del && !v.del && c.owned) {
+      c.owned.forEach(function (f) { if (s(cur[f]) !== "") v[f] = cur[f]; });
+    }
+    merged[id] = v;
   }
   return merged;
+}
+
+function byDateDesc(a, b) {
+  var da = a.del ? "" : s(a.date), db = b.del ? "" : s(b.date);
+  return da < db ? 1 : da > db ? -1 : 0;
 }
 
 function stamp(v) { return v && v.u ? String(v.u) : ""; }
@@ -290,6 +349,142 @@ function normalizePayment(v) {
            gmailId: s(v.gmailId), subject: s(v.subject).slice(0, 120), u: isoOf(v.u) || now };
 }
 
+/* ------------------------------------------------------------------ budget: transactions */
+
+// A transaction is one card/bank line. Ids: e-<gmailId> (from a Chase or Zelle alert),
+// c-<hash> (from a statement CSV, assigned by tools/budget.py), m-<date>-<slug> (typed by hand).
+function txFromRow(r, ctx) {
+  var id = s(r[0]), date = dateStr(r[1]), merchant = s(r[2]);
+  if (!id && !date && !merchant) return null;
+  if (!id) id = uniqueSlug("m-" + date + "-" + merchant, ctx.ids);
+  var updated = isoOf(r[14]) || ctx.now;
+  if (s(r[15]).toUpperCase() === "TRUE") return [id, { del: true, u: updated }];
+  var amount = toNum(r[3]);
+  if (!isDate(date) || amount == null) { ctx.unreadable.push(id + " (date/amount)"); return null; }
+  var tag = s(r[7]).toLowerCase();
+  if (tag && TAGS.indexOf(tag) < 0) { ctx.unreadable.push(id + " (tag '" + tag + "')"); return null; }
+  return [id, {
+    date: date, merchant: merchant.slice(0, 80), amount: amount, account: s(r[4]).toLowerCase(),
+    category: s(r[5]).toLowerCase(), suggested: s(r[6]).toLowerCase(), tag: tag, note: s(r[8]).slice(0, 300),
+    detail: s(r[9]).slice(0, 500), billId: s(r[10]), source: s(r[11]).toLowerCase() || "manual",
+    csv: toBool(r[12]), gmailId: s(r[13]), u: updated
+  }];
+}
+
+function txToRow(id, v) {
+  if (v.del) return [id, "", "", "", "", "", "", "", "", "", "", "", "", "", v.u || "", "TRUE"];
+  return [id, v.date, v.merchant || "", numStr(v.amount), v.account || "", v.category || "", v.suggested || "",
+          v.tag || "", v.note || "", v.detail || "", v.billId || "", v.source || "manual", v.csv ? "TRUE" : "",
+          v.gmailId || "", v.u || "", ""];
+}
+
+function normalizeTx(v) {
+  if (!v || typeof v !== "object") return null;
+  var now = new Date().toISOString();
+  if (v.del) return { del: true, u: isoOf(v.u) || now };
+  var date = s(v.date), amount = toNum(v.amount);
+  if (!isDate(date) || amount == null) return null;
+  var tag = s(v.tag).toLowerCase();
+  if (tag && TAGS.indexOf(tag) < 0) tag = "";
+  var suggested = s(v.suggested).toLowerCase();
+  if (suggested && TAGS.indexOf(suggested) < 0) suggested = "";
+  return {
+    date: date, merchant: s(v.merchant).slice(0, 80), amount: amount, account: s(v.account).toLowerCase(),
+    category: s(v.category).toLowerCase(), suggested: suggested, tag: tag, note: s(v.note).slice(0, 300),
+    detail: s(v.detail).slice(0, 500), billId: s(v.billId), source: s(v.source).toLowerCase() || "manual",
+    csv: toBool(v.csv), gmailId: s(v.gmailId), u: isoOf(v.u) || now
+  };
+}
+
+// Dropdown on tag, frozen header, untagged spend in yellow, frivolous in red. Runs when the tab
+// is created (and from setupBudgetTabs). writeAll clears content only, so this survives pushes.
+function setupTransactionsTab(sh) {
+  var ROWS = 6000, h = COLLECTIONS.transactions.header;
+  var col = function (name) { return h.indexOf(name) + 1; };
+  sh.setFrozenRows(1);
+  var tagRange = sh.getRange(2, col("tag"), ROWS - 1, 1);
+  tagRange.setDataValidation(SpreadsheetApp.newDataValidation().requireValueInList(TAGS, true).setAllowInvalid(false).setHelpText("necessary / unnecessary / frivolous / skip").build());
+  var all = sh.getRange(2, 1, ROWS - 1, h.length);
+  var L = function (name) { return String.fromCharCode(64 + col(name)); };   // column letter (all < Z)
+  var untagged = "=AND($" + L("id") + "2<>\"\", $" + L("tag") + "2=\"\", IFERROR(VALUE($" + L("amount") + "2),0)>0, $" + L("deleted") + "2<>\"TRUE\")";
+  sh.setConditionalFormatRules([
+    SpreadsheetApp.newConditionalFormatRule().whenFormulaSatisfied("=$" + L("tag") + "2=\"frivolous\"").setBackground("#f8d7da").setRanges([all]).build(),
+    SpreadsheetApp.newConditionalFormatRule().whenFormulaSatisfied(untagged).setBackground("#fff3bf").setRanges([all]).build()
+  ]);
+  var widths = { id: 70, date: 90, merchant: 220, amount: 80, account: 60, category: 110, suggested: 100, tag: 110, note: 200,
+                 detail: 360, billId: 90, source: 60, csv: 40, gmailId: 60, updated: 60, deleted: 50 };
+  Object.keys(widths).forEach(function (k) { if (col(k) > 0) sh.setColumnWidth(col(k), widths[k]); });
+  sh.getRange(1, 1, 1, h.length).setFontWeight("bold");
+}
+
+/* ------------------------------------------------------------------ budget: receipts */
+
+// A receipt is one parsed email: an Amazon order (a-<orderId>, several per email are possible),
+// an Amazon refund, a DoorDash final receipt / order confirmation or an Uber receipt (r-<gmailId>).
+function receiptFromRow(r, ctx) {
+  var id = s(r[0]), kind = s(r[1]).toLowerCase(), date = dateStr(r[2]);
+  if (!id && !kind && !date) return null;
+  if (!id) id = uniqueSlug("m-" + date + "-" + s(r[3]), ctx.ids);
+  var updated = isoOf(r[11]) || ctx.now;
+  if (s(r[12]).toUpperCase() === "TRUE") return [id, { del: true, u: updated }];
+  if (!isDate(date) || RECEIPT_KINDS.indexOf(kind) < 0) { ctx.unreadable.push(id + " (date/kind)"); return null; }
+  return [id, { kind: kind, date: date, merchant: s(r[3]).slice(0, 80), total: toNum(r[4]), orderId: s(r[5]),
+                categories: s(r[6]).slice(0, 200), items: s(r[7]).slice(0, 1500), last4: s(r[8]), gmailId: s(r[9]), txId: s(r[10]), u: updated }];
+}
+
+function receiptToRow(id, v) {
+  if (v.del) return [id, "", "", "", "", "", "", "", "", "", "", v.u || "", "TRUE"];
+  return [id, v.kind, v.date, v.merchant || "", numStr(v.total), v.orderId || "", v.categories || "", v.items || "",
+          v.last4 || "", v.gmailId || "", v.txId || "", v.u || "", ""];
+}
+
+function normalizeReceipt(v) {
+  if (!v || typeof v !== "object") return null;
+  var now = new Date().toISOString();
+  if (v.del) return { del: true, u: isoOf(v.u) || now };
+  var kind = s(v.kind).toLowerCase(), date = s(v.date);
+  if (!isDate(date) || RECEIPT_KINDS.indexOf(kind) < 0) return null;
+  return { kind: kind, date: date, merchant: s(v.merchant).slice(0, 80), total: toNum(v.total), orderId: s(v.orderId),
+           categories: s(v.categories).slice(0, 200), items: s(v.items).slice(0, 1500), last4: s(v.last4),
+           gmailId: s(v.gmailId), txId: s(v.txId), u: isoOf(v.u) || now };
+}
+
+function setupReceiptsTab(sh) {
+  var h = COLLECTIONS.receipts.header;
+  sh.setFrozenRows(1);
+  sh.getRange(1, 1, 1, h.length).setFontWeight("bold");
+  var widths = { id: 90, kind: 90, date: 90, merchant: 180, total: 70, orderId: 150, categories: 200, items: 420, last4: 50, gmailId: 60, txId: 90, updated: 60, deleted: 50 };
+  Object.keys(widths).forEach(function (k) { var i = h.indexOf(k); if (i >= 0) sh.setColumnWidth(i + 1, widths[k]); });
+}
+
+/* ------------------------------------------------------------------ budget: targets */
+
+function budgetFromRow(r, ctx) {
+  var id = s(r[0]).toLowerCase();
+  if (!id) return null;
+  var updated = isoOf(r[3]) || ctx.now;
+  if (s(r[4]).toUpperCase() === "TRUE") return [id, { del: true, u: updated }];
+  return [id, { target: toNum(r[1]), note: s(r[2]).slice(0, 300), u: updated }];
+}
+
+function budgetToRow(id, v) {
+  if (v.del) return [id, "", "", v.u || "", "TRUE"];
+  return [id, numStr(v.target), v.note || "", v.u || "", ""];
+}
+
+function normalizeBudget(v) {
+  if (!v || typeof v !== "object") return null;
+  var now = new Date().toISOString();
+  if (v.del) return { del: true, u: isoOf(v.u) || now };
+  return { target: toNum(v.target), note: s(v.note).slice(0, 300), u: isoOf(v.u) || now };
+}
+
+function setupBudgetTab(sh) {
+  sh.setFrozenRows(1);
+  sh.getRange(1, 1, 1, COLLECTIONS.budget.header.length).setFontWeight("bold");
+  sh.setColumnWidth(1, 140); sh.setColumnWidth(2, 90); sh.setColumnWidth(3, 320);
+}
+
 /* ------------------------------------------------------------------ gmail: classification */
 
 var PAY_RE  = /payment (received|confirmation|confirmed|processed|posted|successful|complete|was made|has been made)|thank you for your payment|thanks for your payment|we received your payment|we('ve| have) received your|you(?:'ve| have)? paid|has been paid|auto\s?pay(?:ment)? (processed|complete|posted|was made)|receipt for|payment receipt|your receipt|order confirmation|charged|successfully charged/i;
@@ -389,10 +584,10 @@ function gmailMeta(id) {
   return metaOf(gmailCall(function () { return Gmail.Users.Messages.get("me", id, { format: "metadata", metadataHeaders: ["From", "Subject", "Date"] }); }));
 }
 
-function gmailFull(id) {
+function gmailFull(id, cap) {
   var m = gmailCall(function () { return Gmail.Users.Messages.get("me", id, { format: "full" }); });
   var meta = metaOf(m);
-  meta.body = bodyText(m.payload).slice(0, 20000);
+  meta.body = bodyText(m.payload).slice(0, cap || 20000);
   return meta;
 }
 
@@ -614,10 +809,169 @@ function scanIfDue() {
   return { checked: r.checked, added: r.added.length, updatedBills: r.updatedBills.length, lastScan: r.lastScan };
 }
 
+/* ------------------------------------------------------------------ budget: email harvest */
+
+// What each kind looks for. Chase alerts and Zelle sends become transactions; the others
+// become receipts that tools/budget.py later matches to transactions.
+var BUDGET_KINDS = {
+  chase:    { q: "from:chase.com subject:\"transaction with\"", target: "transactions", body: false },
+  zelle:    { q: "from:mailcenter.usaa.com subject:\"Money Sent\"", target: "transactions", body: true },
+  amazon:   { q: "from:(auto-confirm@amazon.com OR digital-no-reply@amazon.com OR return@amazon.com)", target: "receipts", body: true },
+  doordash: { q: "from:doordash.com subject:(\"Final receipt\" OR \"Order Confirmation\")", target: "receipts", body: true },
+  uber:     { q: "from:noreply@uber.com subject:(trip OR order OR receipt)", target: "receipts", body: true }
+};
+
+var CHASE_ALERT_RE = /^You made a \$([\d,]+\.\d{2}) transaction with (.+?)\.?$/i;
+var ZELLE_RE = /You sent \$([\d,]+\.\d{2}) to (.+?) with Zelle/i;
+var AMZ_ORDER_RE = /Order\s*#\s*(\d{3}-\d{7}-\d{7})[\s\S]{0,600}?(?:Grand Total|Order Total|Total)\s*:?\s*\$?\s*([\d,]+\.\d{2})/gi;
+var AMZ_REFUND_RE = /\$([\d,]+\.\d{2}) will be (?:credited|refunded)/i;
+var DD_ITEM_RE = /(\d+)x\s+([^$]{2,90}?)\s+\$(\d+\.\d{2})/g;
+
+function parseChaseAlert(subject) {
+  var m = CHASE_ALERT_RE.exec(s(subject));
+  if (!m) return null;
+  return { amount: Number(m[1].replace(/,/g, "")), merchant: m[2].trim() };
+}
+
+function parseZelle(subject, body) {
+  var m = ZELLE_RE.exec(s(subject) + " " + s(body));
+  if (!m) return null;
+  return { amount: Number(m[1].replace(/,/g, "")), recipient: m[2].trim() };
+}
+
+// Amazon order confirmation: "Ordered 3 items: Household Supplies, Hand Tools, and more" and one
+// "Order # … Grand Total: 22.44 USD" block per order. Digital orders: "Amazon.com order of <title>".
+function parseAmazon(meta, body) {
+  var subj = s(meta.subject), out = [], m;
+  if (/refund/i.test(subj)) {
+    var rm = AMZ_REFUND_RE.exec(body), om = /orderId=(\d{3}-\d{7}-\d{7})/.exec(body);
+    var item = (/refund issued for (.+?)\.{0,3}$/i.exec(subj) || [])[1] || "";
+    return [{ kind: "amazon-refund", merchant: "Amazon refund", total: rm ? -Number(rm[1].replace(/,/g, "")) : null,
+              orderId: om ? om[1] : "", categories: "", items: item.slice(0, 200) }];
+  }
+  var cats = (/^Ordered \d+ items?:\s*(.+)$/i.exec(subj) || [])[1] || "";
+  cats = cats.replace(/,?\s*and more$/i, "").trim();
+  var digital = (/order of (.+?)\.{0,3}$/i.exec(subj) || [])[1] || "";
+  AMZ_ORDER_RE.lastIndex = 0;
+  while ((m = AMZ_ORDER_RE.exec(body)) !== null) {
+    out.push({ kind: "amazon", merchant: digital ? "Amazon digital" : "Amazon", total: Number(m[2].replace(/,/g, "")),
+               orderId: m[1], categories: digital ? "Digital" : cats, items: digital.slice(0, 200) });
+  }
+  if (!out.length) {
+    out.push({ kind: "amazon", merchant: digital ? "Amazon digital" : "Amazon", total: extractAmount(body, null),
+               orderId: "", categories: digital ? "Digital" : cats, items: digital.slice(0, 200), unparsed: true });
+  }
+  return out;
+}
+
+// DoorDash: "Final receipt for Beck from Target" / "Order Confirmation for Beck from Panera Bread".
+// Body: "Paid with Visa Ending in 1234 … Target Total: $225.33 … 1x Item $4.69 …"
+function parseDoorDash(meta, body) {
+  var subj = s(meta.subject);
+  var merchant = (/ from (.+?)\s*$/i.exec(subj) || [])[1] || "DoorDash";
+  var isFinal = /final receipt/i.test(subj);
+  var tm = new RegExp(escapeRe(merchant) + "\\s+Total:\\s*\\$([\\d,]+\\.\\d{2})", "i").exec(body)
+        || /(?:^|\s)Total:\s*\$([\d,]+\.\d{2})/.exec(body) || /Estimated Total\s*\$([\d,]+\.\d{2})/i.exec(body);
+  var l4 = /Ending in (\d{4})/i.exec(body);
+  var items = [], m;
+  DD_ITEM_RE.lastIndex = 0;
+  while ((m = DD_ITEM_RE.exec(body)) !== null && items.length < 40) items.push(m[1] + "x " + m[2].trim() + " $" + m[3]);
+  return { kind: isFinal ? "doordash" : "doordash-order", merchant: merchant.slice(0, 80),
+           total: tm ? Number(tm[1].replace(/,/g, "")) : null, orderId: "", categories: "", items: items.join("; ").slice(0, 1500), last4: l4 ? l4[1] : "" };
+}
+
+// Uber ride / Uber Eats receipt: "Total $59.16 … Visa ••••9995 $59.16". Addresses are not kept.
+function parseUber(meta, body) {
+  var tm = /Total\s*\$([\d,]+\.\d{2})/.exec(body);
+  var l4 = /(?:Visa|Mastercard|Amex|Card)\s*[•*]+\s*(\d{4})/i.exec(body);
+  var eats = /eats|order/i.test(s(meta.subject)) && !/trip/i.test(s(meta.subject));
+  var when = (/^Your (.+?) (?:trip|order) with Uber/i.exec(s(meta.subject)) || [])[1] || "";
+  return { kind: "uber", merchant: eats ? "Uber Eats" : "Uber ride", total: tm ? Number(tm[1].replace(/,/g, "")) : extractAmount(meta.subject + " " + meta.snippet, null),
+           orderId: "", categories: eats ? "delivery" : "rides", items: when, last4: l4 ? l4[1] : "" };
+}
+
+function escapeRe(x) { return String(x).replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); }
+
+// Daily trigger entry point: last 40 days, every kind.
+function scanBudgetDaily() { return scanBudget({ kind: "all", days: SCAN_DAYS }); }
+
+// Admin op budgetscan and the daily trigger. Window: after/before (YYYY/MM/DD) or newer_than:<days>d.
+function scanBudget(opts) {
+  opts = opts || {};
+  var dry = !!opts.dry, now = new Date().toISOString(), max = opts.max || 300;
+  var kinds = opts.kind && opts.kind !== "all" ? opts.kind.split(",").filter(function (k) { return BUDGET_KINDS[k]; }) : Object.keys(BUDGET_KINDS);
+  if (!kinds.length) return { ok: false, error: "unknown kind; use " + Object.keys(BUDGET_KINDS).join(",") };
+  var tx = readAll("transactions"), rc = readAll("receipts");
+  if (tx.__unreadable) return { ok: false, error: "unreadable transactions rows: " + tx.__unreadable.join(", ") };
+  if (rc.__unreadable) return { ok: false, error: "unreadable receipts rows: " + rc.__unreadable.join(", ") };
+  var window = (opts.after || opts.before)
+    ? ((opts.after ? "after:" + opts.after + " " : "") + (opts.before ? "before:" + opts.before : "")).trim()
+    : "newer_than:" + (opts.days || SCAN_DAYS) + "d";
+
+  // Emails already harvested, so bodies are never fetched twice (tombstones count as seen).
+  var seen = {}, k;
+  for (k in rc) if (k.indexOf("__") !== 0) { if (rc[k].gmailId) seen[rc[k].gmailId] = true; if (k.indexOf("r-") === 0) seen[k.slice(2)] = true; }
+  for (k in tx) if (k.indexOf("e-") === 0) seen[k.slice(2)] = true;
+
+  var added = [], warnings = [], checked = 0, dup = 0, truncated = [], txDirty = false, rcDirty = false;
+  kinds.forEach(function (kind) {
+    var def = BUDGET_KINDS[kind];
+    var ids = gmailSearch(def.q + " " + window, max);
+    if (ids.length >= max) truncated.push(kind);
+    ids.forEach(function (id) {
+      if (seen[id]) { dup++; return; }
+      seen[id] = true;
+      checked++;
+      var meta = def.body ? gmailFull(id, 60000) : gmailMeta(id);
+      var body = meta.body || "";
+      if (kind === "chase") {
+        var a = parseChaseAlert(meta.subject);
+        if (!a) { if (warnings.length < 40) warnings.push("chase: unparsed subject '" + meta.subject.slice(0, 70) + "' " + id); return; }
+        tx["e-" + id] = { date: meta.date, merchant: a.merchant, amount: a.amount, account: "chase", category: "", suggested: "", tag: "", note: "",
+                          detail: "", billId: "", source: "alert", csv: false, gmailId: id, u: now };
+        txDirty = true; added.push({ id: "e-" + id, kind: kind, date: meta.date, amount: a.amount, merchant: a.merchant });
+      } else if (kind === "zelle") {
+        var z = parseZelle(meta.subject, body);
+        if (!z) { if (warnings.length < 40) warnings.push("zelle: unparsed " + id); return; }
+        tx["e-" + id] = { date: meta.date, merchant: "Zelle to " + z.recipient, amount: z.amount, account: "usaa", category: "", suggested: "", tag: "", note: "",
+                          detail: "", billId: "", source: "zelle", csv: false, gmailId: id, u: now };
+        txDirty = true; added.push({ id: "e-" + id, kind: kind, date: meta.date, amount: z.amount, merchant: "Zelle to " + z.recipient });
+      } else {
+        var recs = kind === "amazon" ? parseAmazon(meta, body) : kind === "doordash" ? [parseDoorDash(meta, body)] : [parseUber(meta, body)];
+        recs.forEach(function (r) {
+          var rid = (r.kind === "amazon" && r.orderId) ? "a-" + r.orderId : "r-" + id;
+          if (rc[rid] && rc[rid].gmailId !== id) { dup++; return; }       // same order confirmed twice
+          if (r.unparsed && warnings.length < 40) warnings.push("amazon: no order block in " + id + " '" + meta.subject.slice(0, 60) + "'");
+          if (r.total == null && warnings.length < 40) warnings.push(kind + ": no total in " + id + " '" + meta.subject.slice(0, 60) + "'");
+          rc[rid] = { kind: r.kind, date: meta.date, merchant: r.merchant, total: r.total, orderId: r.orderId || "", categories: r.categories || "",
+                      items: r.items || "", last4: r.last4 || "", gmailId: id, txId: "", u: now };
+          rcDirty = true; added.push({ id: rid, kind: r.kind, date: meta.date, amount: r.total, merchant: r.merchant, orderId: r.orderId || "", items: (r.items || "").slice(0, 80) });
+        });
+      }
+    });
+  });
+
+  if (!dry && (txDirty || rcDirty)) {
+    var lock = LockService.getScriptLock();
+    lock.waitLock(10000);
+    try {
+      if (txDirty) writeAll("transactions", tx);
+      if (rcDirty) writeAll("receipts", rc);
+      setProp("LAST_BUDGET_SCAN", now);
+    } finally { lock.releaseLock(); }
+  } else if (!dry) setProp("LAST_BUDGET_SCAN", now);
+  return { ok: true, dry: dry, window: window, kinds: kinds, checked: checked, added: added, skipped: { dup: dup },
+           truncated: truncated, warnings: warnings, lastBudgetScan: now };
+}
+
 function installTrigger() {
-  ScriptApp.getProjectTriggers().forEach(function (t) { if (t.getHandlerFunction() === "scanGmail") ScriptApp.deleteTrigger(t); });
+  ScriptApp.getProjectTriggers().forEach(function (t) {
+    var h = t.getHandlerFunction();
+    if (h === "scanGmail" || h === "scanBudgetDaily") ScriptApp.deleteTrigger(t);
+  });
   ScriptApp.newTrigger("scanGmail").timeBased().everyDays(1).atHour(6).create();
-  Logger.log("Daily scanGmail trigger installed (06:00 " + tz() + ").");
+  ScriptApp.newTrigger("scanBudgetDaily").timeBased().everyDays(1).atHour(6).create();
+  Logger.log("Daily scanGmail + scanBudgetDaily triggers installed (06:00 " + tz() + ").");
 }
 
 /* ------------------------------------------------------------------ debugging */
@@ -626,13 +980,19 @@ function installTrigger() {
 function debugRead() {
   var ss = SpreadsheetApp.getActiveSpreadsheet();
   Logger.log("spreadsheet: " + ss.getName() + " | tabs: " + ss.getSheets().map(function (sh) { return sh.getName() + "(" + sh.getLastRow() + " rows)"; }).join(", "));
-  NAMES.forEach(function (name) {
+  NAMES.concat(BUDGET_NAMES).forEach(function (name) {
     var obj = readAll(name);
     var ids = Object.keys(obj).filter(function (k) { return k.indexOf("__") !== 0; });
-    Logger.log(name + ": " + ids.length + " rows: " + ids.join(", "));
+    Logger.log(name + ": " + ids.length + " rows" + (ids.length <= 60 ? ": " + ids.join(", ") : ""));
     if (obj.__unreadable) Logger.log(name + " UNREADABLE: " + obj.__unreadable.join(", "));
   });
-  Logger.log("ADMIN_TOKEN set: " + !!getProp("ADMIN_TOKEN") + " | LAST_SCAN: " + (getProp("LAST_SCAN") || "never"));
+  Logger.log("ADMIN_TOKEN set: " + !!getProp("ADMIN_TOKEN") + " | LAST_SCAN: " + (getProp("LAST_SCAN") || "never") + " | LAST_BUDGET_SCAN: " + (getProp("LAST_BUDGET_SCAN") || "never"));
+}
+
+// Run from the editor to (re)apply the dropdown, freeze and colours to budget tabs that already exist.
+function setupBudgetTabs() {
+  BUDGET_NAMES.forEach(function (name) { var c = COLLECTIONS[name]; if (c.setup) c.setup(sheet(name)); });
+  Logger.log("budget tabs formatted");
 }
 
 /* ------------------------------------------------------------------ helpers */
