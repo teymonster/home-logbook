@@ -1153,6 +1153,40 @@ def cmd_tag(args):
     cmd_pull(args)
 
 
+def cmd_targets(args):
+    """budget tab: target = average monthly spend per category over the last N full months (targets are Sheet-owned; --force overwrites)."""
+    guard_repo()
+    sheet = cmd_pull(args)
+    tx = live(sheet["transactions"])
+    today = dt.date.today()
+    months, m = [], today.replace(day=1)
+    for _ in range(args.months):
+        m = (m - dt.timedelta(days=1)).replace(day=1)
+        months.append(m.isoformat()[:7])
+    per = collections.defaultdict(float)
+    for t in tx.values():
+        if t["date"][:7] in months and t.get("tag") != "skip" and t.get("category") and t["category"] not in ("income", "transfer"):
+            per[t["category"]] += t["amount"]
+    stamp = now_iso()
+    cur = live(sheet["budget"])
+    rows = {}
+    for c, total in sorted(per.items()):
+        avg = total / args.months
+        if avg <= 0:
+            continue
+        existing = cur.get(c, {})
+        if existing.get("target") is not None and not args.force:
+            continue
+        rows[c] = {"target": round(avg), "note": "%d-month average %s to %s" % (args.months, months[-1], months[0]), "u": stamp}
+    print("targets: %d categories%s%s" % (len(rows), " (DRY)" if args.dry else "", " [force]" if args.force else ""))
+    for c, r in sorted(rows.items(), key=lambda kv: -kv[1]["target"]):
+        print("  %-16s %8s" % (c, money(r["target"])))
+    if args.dry or not rows:
+        return
+    sheet_post({"budget": rows}, force=args.force)
+    cmd_pull(args)
+
+
 def cmd_pull(_args):
     guard_repo()
     j = sheet_get()
@@ -1400,12 +1434,13 @@ def main(argv=None):
     rp = sub.add_parser("report"); rp.add_argument("--months", type=int, default=12)
     rs = sub.add_parser("rescan-receipts"); rs.add_argument("--dry", action="store_true")
     ac = sub.add_parser("accept-suggestions"); ac.add_argument("--dry", action="store_true")
+    tt = sub.add_parser("targets"); tt.add_argument("--months", type=int, default=12); tt.add_argument("--force", action="store_true", help="overwrite targets already set (admin token)"); tt.add_argument("--dry", action="store_true")
     tg = sub.add_parser("tag"); tg.add_argument("--category"); tg.add_argument("--merchant", help="regex on the merchant text"); tg.add_argument("--tag", required=True); tg.add_argument("--dry", action="store_true")
     rn = sub.add_parser("run"); rn.add_argument("--months", type=int, default=12); rn.add_argument("--dry", action="store_true")
     args = ap.parse_args(argv)
     guard_repo()
     {"pull": cmd_pull, "backfill": cmd_backfill, "ingest": cmd_ingest, "match": cmd_match, "push": cmd_push, "report": cmd_report, "run": cmd_run,
-     "rescan-receipts": cmd_rescan_receipts, "accept-suggestions": cmd_accept_suggestions, "tag": cmd_tag}[args.cmd](args)
+     "rescan-receipts": cmd_rescan_receipts, "accept-suggestions": cmd_accept_suggestions, "tag": cmd_tag, "targets": cmd_targets}[args.cmd](args)
 
 
 if __name__ == "__main__":
