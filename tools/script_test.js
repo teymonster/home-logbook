@@ -102,8 +102,8 @@ test("parseAmazon splits a two-order confirmation and keeps the categories", () 
 });
 
 test("parseAmazon handles digital orders, refunds and unparsed bodies", () => {
-  const d = parseAmazon({ subject: "Amazon.com order of Some Novel Title." }, "Order # 111-0000000-0000009 Order Total: $4.99");
-  assert.deepStrictEqual([d[0].merchant, d[0].categories, d[0].items, d[0].total], ["Amazon digital", "Digital", "Some Novel Title", 4.99]);
+  const d = parseAmazon({ subject: "Amazon.com order of Some Novel Title." }, "Order # D01-0000000-0000009 Order Total: $4.99");
+  assert.deepStrictEqual([d[0].merchant, d[0].categories, d[0].items, d[0].total, d[0].orderId], ["Amazon digital", "Digital", "Some Novel Title", 4.99, "D01-0000000-0000009"]);
   const f = parseAmazon({ subject: "Advance refund issued for Widget Thing, Small..." }, "Your refund was issued. $4.49 will be credited to your Visa by Oct 3. View (https://x?orderId=111-0000000-0000003&y=1)");
   assert.deepStrictEqual([f[0].kind, f[0].total, f[0].orderId, f[0].items], ["amazon-refund", -4.49, "111-0000000-0000003", "Widget Thing, Small"]);
   const u = parseAmazon({ subject: "Ordered 1 item: Clothing" }, "nothing useful $12.00");
