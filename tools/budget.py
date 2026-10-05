@@ -185,7 +185,8 @@ DEFAULT_RULES = {
         {"re": r"DENTAL|THERAPY|WELLNESS|CLINIC|PHYSICIAN|HOSPITAL|PHARMACY|OPTICAL|ZENNI|URGENT CARE|LABCORP|QUEST DIAG|MEDICAL|ORTHO|DERMAT|COUNSELING", "category": "health", "suggested": "necessary"},
         {"re": r"NAILS|SPA |SPA$|SALON|BARBER|MASSAGE|HAIR|OMNILUX|SEPHORA|ULTA", "category": "personal", "suggested": ""},
         {"re": r"NETFLIX|HULU|SPOTIFY|PARAMOUNT|PEACOCK|DISNEY|APPLE\.COM/BILL|CURIOSITY|MIDJOURNEY|OPENAI|CHATGPT|GODADDY|OURPACT|PLUME|ROOST|EHARMONY|BARK TECHNOLOGIES|OUR FAMILY WIZARD|WALMART\+|ADOBE|INTUIT|PLAUD|MIRANTIS|PATREON|SUBSTACK|YOUTUBE|GOOGLE \*|MICROSOFT", "category": "subscription", "suggested": ""},
-        {"re": r"LIFE TIME|LIFETIME|LTFITNESS|FITNESS DEPOT|PLANET FIT|YMCA", "category": "membership", "suggested": ""},
+        {"re": r"FITNESS DEPOT", "category": "membership", "suggested": "unnecessary"},
+        {"re": r"LIFE TIME|LIFETIME|LTFITNESS|PLANET FIT|YMCA", "category": "membership", "suggested": ""},
         {"re": r"NSSD112|NORTH SHORE SCHOOL|SCHOOL|CAMP |ART CENTER|IMPERISOFT|ACTIVE NETWORK|QUINLAN AND FABISH|FIVE BELOW|LEARNING|TUTOR|SCOUTS", "category": "kids", "suggested": "necessary"},
         {"re": r"ALASKA AIR|SOUTHWES|UNITED|DELTA|AMERICAN AIR|PRICELN|HOTEL|HTL|INN |INN$|LODGE|RESORT|MARRIOTT|HILTON|HYATT|AIRBNB|VRBO|CAMPING|CAMPGROUND|AMTRAK|HEADOUT|EXPEDIA|TRIPADVISOR|HERTZ|ENTERPRISE RENT|NIAGARA", "category": "travel", "suggested": ""},
         {"re": r"STUBHUB|TICKETMASTER|AMC |CINEMA|THEATRE|THEATER|MUSEUM|ZOO|BOWL|ARCADE|STEAM GAMES|NINTENDO|PLAYSTATION|XBOX", "category": "entertainment", "suggested": "unnecessary"},
@@ -983,19 +984,25 @@ def cmd_tag(args):
     guard_repo()
     if args.tag not in TAGS:
         die("tag must be one of " + ", ".join(TAGS))
-    cats = {c.strip().lower() for c in args.category.split(",") if c.strip()}
+    cats = {c.strip().lower() for c in (args.category or "").split(",") if c.strip()}
+    merchant = re.compile(args.merchant, re.I) if args.merchant else None
+    if not cats and not merchant:
+        die("give --category and/or --merchant")
     sheet = cmd_pull(args)
     tx = live(sheet["transactions"])
     stamp = now_iso()
     rows, kept = {}, collections.Counter()
     for k, t in tx.items():
-        if (t.get("category") or "") not in cats:
+        if cats and (t.get("category") or "") not in cats:
+            continue
+        if merchant and not merchant.search(t.get("merchant") or ""):
             continue
         if t.get("tag"):
             kept[t["tag"]] += 1
             continue
         rows[k] = dict(t, tag=args.tag, suggested="", u=stamp)
-    print("tag %s on %s: %d rows to fill, already tagged and left alone: %s%s" % (args.tag, ",".join(sorted(cats)), len(rows), dict(kept) or "none", " (DRY)" if args.dry else ""))
+    scope = ",".join(sorted(cats)) + ((" merchant~/%s/" % args.merchant) if merchant else "")
+    print("tag %s on %s: %d rows to fill, already tagged and left alone: %s%s" % (args.tag, scope, len(rows), dict(kept) or "none", " (DRY)" if args.dry else ""))
     if args.dry or not rows:
         return
     ids = list(rows)
@@ -1250,7 +1257,7 @@ def main(argv=None):
     rp = sub.add_parser("report"); rp.add_argument("--months", type=int, default=12)
     rs = sub.add_parser("rescan-receipts"); rs.add_argument("--dry", action="store_true")
     ac = sub.add_parser("accept-suggestions"); ac.add_argument("--dry", action="store_true")
-    tg = sub.add_parser("tag"); tg.add_argument("--category", required=True); tg.add_argument("--tag", required=True); tg.add_argument("--dry", action="store_true")
+    tg = sub.add_parser("tag"); tg.add_argument("--category"); tg.add_argument("--merchant", help="regex on the merchant text"); tg.add_argument("--tag", required=True); tg.add_argument("--dry", action="store_true")
     rn = sub.add_parser("run"); rn.add_argument("--months", type=int, default=12); rn.add_argument("--dry", action="store_true")
     args = ap.parse_args(argv)
     guard_repo()
