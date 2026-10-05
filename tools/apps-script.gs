@@ -823,7 +823,7 @@ var BUDGET_KINDS = {
 
 var CHASE_ALERT_RE = /^You made a \$([\d,]+\.\d{2}) transaction with (.+?)\.?$/i;
 var ZELLE_RE = /You sent \$([\d,]+\.\d{2}) to (.+?) with Zelle/i;
-var AMZ_ORDER_RE = /Order\s*#\s*(\d{3}-\d{7}-\d{7})[\s\S]{0,600}?(?:Grand Total|Order Total|Total)\s*:?\s*\$?\s*([\d,]+\.\d{2})/gi;
+var AMZ_ORDER_RE = /Order\s*#\s*([A-Z0-9]{3}-\d{7}-\d{7})[\s\S]{0,600}?(?:Grand Total|Order Total|Total)\s*:?\s*\$?\s*([\d,]+\.\d{2})/gi;
 var AMZ_REFUND_RE = /\$([\d,]+\.\d{2}) will be (?:credited|refunded)/i;
 var DD_ITEM_RE = /(\d+)x\s+([^$]{2,90}?)\s+\$(\d+\.\d{2})/g;
 
@@ -844,7 +844,7 @@ function parseZelle(subject, body) {
 function parseAmazon(meta, body) {
   var subj = s(meta.subject), out = [], m;
   if (/refund/i.test(subj)) {
-    var rm = AMZ_REFUND_RE.exec(body), om = /orderId=(\d{3}-\d{7}-\d{7})/.exec(body);
+    var rm = AMZ_REFUND_RE.exec(body), om = /orderId=([A-Z0-9]{3}-\d{7}-\d{7})/.exec(body);
     var item = (/refund issued for (.+?)\.{0,3}$/i.exec(subj) || [])[1] || "";
     return [{ kind: "amazon-refund", merchant: "Amazon refund", total: rm ? -Number(rm[1].replace(/,/g, "")) : null,
               orderId: om ? om[1] : "", categories: "", items: item.slice(0, 200) }];

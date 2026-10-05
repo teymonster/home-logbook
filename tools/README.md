@@ -53,6 +53,26 @@ at 60 messages per bill per run (`max=` up to 300 for admin backfills).
 
 Bill rows can also be written with the app token: `POST {token, bills:{id:{...,u}}}`.
 
+## Budget (tools/budget.py)
+
+Three more tabs, `transactions`, `receipts` and `budget`, hold every charge, the parsed receipt
+emails and the monthly targets. They are outside the app's sync set: `GET ?token&budget=1` returns
+them and a POST writes them only when it sends them. Columns `tag`, `note` and `category` on
+`transactions` (and `target`, `note` on `budget`) belong to the Sheet: a filled cell survives every
+push, an empty one is filled on the next push.
+
+```sh
+python3 tools/budget.py backfill --months 12   # admin: harvest Chase alerts, Zelle sends, Amazon/DoorDash/Uber receipts, month by month
+python3 tools/budget.py run                    # pull → ingest budget/statements/ → match → push → report (budget/report.md)
+python3 tools/budget.py push --dry             # preview what would be written
+node tools/script_test.js && python3 tools/budget_test.py
+```
+
+`budget/` is gitignored: `statements/` takes Chase monthly statement PDFs or CSV exports and USAA
+CSV exports, `rules.json` maps merchants to categories and default tags, `cache/` holds the pulled
+Sheet and the proposal, `report.md` is the breakdown. The daily `scanBudgetDaily` trigger keeps
+harvesting new emails; `installTrigger` installs both triggers.
+
 ## Devices
 
 - A device remembers the passphrase until you open the site with `?staticrypt_logout` on
