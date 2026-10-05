@@ -123,10 +123,10 @@ def sheet_post(body):
     return j
 
 
-def admin_get(**params):
+def admin_get(timeout=330, **params):
     c = cfg(admin=True)
     params["admin"] = c["admin"]
-    return http_json(c["url"] + "?" + urllib.parse.urlencode(params))
+    return http_json(c["url"] + "?" + urllib.parse.urlencode(params), timeout=timeout)
 
 
 def load_cache(name, required=True):
@@ -525,7 +525,11 @@ def cmd_rescan_receipts(args):
         if not gid:
             still.append((rid, "no gmailId"))
             continue
-        p = admin_get(op="peek", id=gid)
+        try:
+            p = admin_get(op="peek", id=gid, timeout=45)
+        except SystemExit:
+            still.append((rid, "endpoint error"))
+            continue
         if not p.get("ok"):
             still.append((rid, p.get("error")))
             continue
@@ -545,19 +549,29 @@ def cmd_rescan_receipts(args):
         if args.dry and i < 8:
             print("  %s → %s" % (rid, [(r["kind"], r["orderId"], r["total"], r["items"][:40]) for r in recs]))
         if (i + 1) % 25 == 0:
-            print("  %d read" % (i + 1))
+            print("  %d read (%d repaired, %d retired, %d unreadable)" % (i + 1, len(new_rows), len(tombstones), len(still)))
+            if not args.dry:
+                flush_receipts(new_rows, tombstones)
     print("repaired %d rows, %d placeholders retired, %d still unreadable" % (len(new_rows), len(tombstones), len(still)))
     for rid, why in still[:30]:
         print("  still:", rid, why)
     if args.dry:
         return
+    flush_receipts(new_rows, tombstones)
+    cmd_pull(args)
+
+
+def flush_receipts(new_rows, tombstones):
+    """Push what the repair has so far, then forget it, so a restart never loses or repeats work."""
     body = dict(new_rows)
     body.update(tombstones)
     ids = list(body)
     for i in range(0, len(ids), BATCH):
         sheet_post({"receipts": {k: body[k] for k in ids[i:i + BATCH]}})
-    print("  pushed")
-    cmd_pull(args)
+    if ids:
+        print("  pushed %d receipt rows" % len(ids))
+    new_rows.clear()
+    tombstones.clear()
 
 
 # ------------------------------------------------------------------------------------ match
