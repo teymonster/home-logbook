@@ -32,7 +32,7 @@
  * typo in the Sheet can never cause rows to be dropped.
  */
 
-var VERSION = 10;
+var VERSION = 11;
 var CADENCES = ["weekly", "monthly", "bimonthly", "quarterly", "semiannual", "annual"];
 var SCAN_DAYS = 40;             // default look-back for the daily / on-demand scan
 var SCAN_MIN_GAP_MS = 5 * 60 * 1000;
