@@ -156,17 +156,18 @@ DEFAULT_RULES = {
             "doordash map receipt words to a default tag. categories gives each budget category a default tag.",
     "merchants": [
         {"re": r"CHASE CREDIT CRD|AUTOPAY PAYMENT|Payment Thank You|USAA FUNDS TRANSFER|ONLINE TRANSFER|^CHECK$|INTERNET TRANSFER", "category": "transfer", "suggested": "skip"},
-        {"re": r"PAYROLL|DIRECT DEP|TEXAS OAG|CHILD SUPPORT|INTEREST PAID|ATM REBATE|NAVAN|EXPENSIFY", "category": "income", "suggested": ""},
+        {"re": r"PAYROLL|DIRECT DEP|TEXAS OAG|CHILD SUPPORT|INTEREST PAID|ATM REBATE|NAVAN|EXPENSIFY|DEPOSIT@MOBILE|MOBILE DEPOSIT", "category": "income", "suggested": ""},
         {"re": r"\bATM\b|CASH WITHDRAWAL|PAI ATM", "category": "cash", "suggested": ""},
         {"re": r"VENMO|CASH APP|ZELLE", "category": "p2p", "suggested": ""},
         {"re": r"DD \*DOORDASH|DOORDASH|GRUBHUB|UBER \*EATS|UBER EATS|INSTACART|HUNGRYROOT", "category": "delivery", "suggested": "unnecessary"},
         {"re": r"DASHPASS", "category": "subscription", "suggested": "unnecessary"},
         {"re": r"UBER(?! \*EATS)|LYFT|METRA|VENTRA|CTA |PACE BUS", "category": "rides", "suggested": ""},
-        {"re": r"AMAZON|AMZN|PRIME VIDEO|KINDLE SVCS|KINDLE UNLTD|AUDIBLE", "category": "amazon", "suggested": ""},
+        {"re": r"PRIME VIDEO|KINDLE SVCS|KINDLE UNLTD|AUDIBLE|AMAZON PRIME\*|AMAZON MUSIC", "category": "subscription", "suggested": ""},
+        {"re": r"AMAZON|AMZN", "category": "amazon", "suggested": ""},
         {"re": r"WHOLEFDS|WHOLE FOODS|JEWEL|MARIANO|TRADER JOE|ALDI|COSTCO|SUNSET FOODS|WOODMANS|H-E-B|KROGER|HEINEN|FRESH MARKET", "category": "groceries", "suggested": "necessary"},
         {"re": r"TARGET|WALMART|WALGREENS|CVS/PHARM|CVS |HOMEDEPOT|HOME DEPOT|LOWES|MENARDS|ACE HDWE|ACE HARDWARE", "category": "household", "suggested": "necessary"},
-        {"re": r"SHELL|BP#|MOBIL|EXXON|SPEEDWAY|CITGO|MARATHON|THORNTONS|CASEYS|PILOT_|GAS/CARWASH|COSTCO GAS|WAWA|LOVE'S", "category": "gas", "suggested": "necessary"},
-        {"re": r"MULLER AUTO|ADVANCE AUTO|AUTOZONE|JIFFY LUBE|FIRESTONE|DISCOUNT TIRE|CAR WASH|IL SOS|SECRETARY OF STATE|TOLLWAY|I-PASS|PARKING", "category": "auto", "suggested": "necessary"},
+        {"re": r"SHELL OIL|\bSHELL\b|BP#|\bMOBIL\b|EXXON|SPEEDWAY|CITGO|MARATHON|THORNTONS|CASEYS|PILOT_|BUC-EE|GAS/CARWASH|COSTCO GAS|WAWA|LOVE'S|KWIK TRIP|7-ELEVEN", "category": "gas", "suggested": "necessary"},
+        {"re": r"MULLER AUTO|ADVANCE AUTO|AUTOZONE|JIFFY LUBE|FIRESTONE|DISCOUNT TIRE|CAR WASH|IL SOS|SECRETARY OF STA|TOLLWAY|I-PASS|EZ TAG|TOLL|PARKING|SPOTHERO", "category": "auto", "suggested": "necessary"},
         {"re": r"COMED|NORTH SHORE GAS|NICOR|CHARIOT ENERGY|CITY OF HIGHLAND PARK|HIGHLAND PARK WATER|MUNICIPAL ONLINE|LRS", "category": "utility", "suggested": "necessary"},
         {"re": r"ATT\*BILL|AT&T|VERIZON|T-MOBILE", "category": "phone", "suggested": "necessary"},
         {"re": r"COMCAST|XFINITY", "category": "internet", "suggested": "necessary"},
@@ -683,6 +684,18 @@ class Matcher:
                 t["detail"] = "no order email matched (digital, Prime Video, Subscribe & Save, Whole Foods or gift card?)"
                 self.notes["amazonChargeUnmatched"].append((k, t["date"], t["amount"], t["merchant"]))
 
+    def delivery_default(self, merchant):
+        """DD *DOORDASH JEWEL-OSC → the rules.doordash entry for Jewel-Osco, if any."""
+        m = re.sub(r"^(DD \*DOORDASH|DOORDASH\*?|UBER \*EATS)\s*", "", merchant, flags=re.I)
+        key = re.sub(r"[^a-z0-9]", "", m.split(" 8")[0].lower())[:8]
+        if not key:
+            return ""
+        for name, tag in self.r["doordash"].items():
+            n = re.sub(r"[^a-z0-9]", "", name.lower())
+            if n.startswith(key) or key.startswith(n[:len(key)]):
+                return tag_ok(tag)
+        return ""
+
     def link_amazon(self, rid, r, chosen, exact_order):
         first_cat = (r.get("categories") or "").split(",")[0].strip()
         sug = tag_ok(self.r["amazonCategory"].get(first_cat, ""))
@@ -702,10 +715,12 @@ class Matcher:
             bill = self.bills.get(t.get("billId") or "", {})
             bcat = (bill.get("category") or "").lower()
             ccat = self.r["csvCategories"].get((t.pop("_csvCat", "") or "").lower(), "")
-            cat = t.pop("_cat", "") or rcat or bcat or ccat or ""
+            cat = t.pop("_cat", "") or bcat or rcat or ccat or ""
             if not t.get("category"):
                 t["category"] = cat
             sug = t.pop("_sug", "")
+            if not sug and cat == "delivery" and not t.get("detail"):
+                sug = self.delivery_default(t["merchant"])
             if not sug:
                 if bill:
                     sug = tag_ok(self.r["billCategories"].get(bcat, ""))
@@ -929,15 +944,16 @@ def cmd_report(args):
     L.append("")
 
     # -- Amazon
-    amz = {k: t for k, t in spend.items() if t.get("category") == "amazon" or AMAZON_RE.search(t["merchant"])}
+    amz = {k: t for k, t in spend.items() if t.get("category") == "amazon"}
     L.append("## Amazon\n")
     if amz:
         charges = [t for t in amz.values() if t["amount"] > 0]
         credits = [t for t in amz.values() if t["amount"] < 0]
-        matched = [t for t in charges if t.get("detail", "").startswith("order ")]
-        L.append("%d charges totalling %s (%s/month), %d refunds totalling %s. %d charges matched to an order email, %d not.\n"
+        matched = [t for t in charges if t.get("detail", "").startswith("order ") and "(no order email" not in t["detail"]]
+        numbered = [t for t in charges if "(no order email" in t.get("detail", "")]
+        L.append("%d charges totalling %s (%s/month), %d refunds totalling %s. %d charges matched to an order email, %d carry an order number but its email is not harvested yet, %d have neither.\n"
                  % (len(charges), money(sum(t["amount"] for t in charges)), money(sum(t["amount"] for t in charges) / n), len(credits), money(-sum(t["amount"] for t in credits)),
-                    len(matched), len(charges) - len(matched)))
+                    len(matched), len(numbered), len(charges) - len(matched) - len(numbered)))
         mm = by_month(amz)
         L.append(table(["month"] + months, [["Amazon net"] + [money(mm.get(mo, 0)) for mo in months]]))
         L.append("")
@@ -950,7 +966,7 @@ def cmd_report(args):
         L.append("")
         tagc = collections.Counter(eff(t) or "untagged" for t in charges)
         L.append("Tags on Amazon charges: " + ", ".join("%s %d" % (k, v) for k, v in tagc.most_common()) + ".\n")
-        unm = sorted((t for t in charges if t not in matched), key=lambda t: -t["amount"])[:20]
+        unm = sorted((t for t in charges if t not in matched and t not in numbered), key=lambda t: -t["amount"])[:20]
         if unm:
             L.append("Largest Amazon charges with no matching order email (digital, Prime Video, Subscribe & Save, Whole Foods, or the order email is older than the harvest window):\n")
             L.append(table(["date", "amount", "merchant"], [[t["date"], money(t["amount"]), t["merchant"]] for t in unm]))

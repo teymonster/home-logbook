@@ -145,8 +145,13 @@ class Matching(unittest.TestCase):
     def test_doordash_receipt_items_land_in_detail_with_fuzzy_amount(self):
         sh = sheet(receipts={"r-d1": {"kind": "doordash", "date": "2026-10-04", "merchant": "Target", "total": 225.33, "orderId": "", "categories": "",
                                       "items": "1x Nutmeg $4.69; 2x Chicken $12.99", "last4": "1234", "gmailId": "d1", "txId": ""}})
-        out, links, _ = self.run_match(sh, [csvrow("2026-10-05", "DD *DOORDASH TARGET 855-431-0459 CA", 226.02)])
-        t = next(iter(out.values()))
+        out, links, _ = self.run_match(sh, [csvrow("2026-10-05", "DD *DOORDASH TARGET 855-431-0459 CA", 226.02),
+                                            csvrow("2026-10-06", "DD *DOORDASH JEWEL-OSC 855-431-0459 CA", 80.00),
+                                            csvrow("2026-10-06", "DD *DOORDASH MCDONALDS 855-431-0459 CA", 30.00)])
+        by_amt = {round(t["amount"], 2): t for t in out.values()}
+        self.assertEqual(by_amt[80.0]["suggested"], "necessary")      # grocery merchant read from the card descriptor, no receipt needed
+        self.assertEqual(by_amt[30.0]["suggested"], "unnecessary")
+        t = by_amt[226.02]
         self.assertEqual(t["category"], "delivery")
         self.assertEqual(t["suggested"], "necessary")           # Target via DoorDash counts as groceries per the default rules
         self.assertIn("Target: 1x Nutmeg $4.69", t["detail"])
@@ -163,7 +168,7 @@ class Matching(unittest.TestCase):
                                          csvrow("2026-09-06", "NETFLIX.COM 866-579-7172 CA", 9.91)])
         self.assertEqual(len(out), 2)
         self.assertEqual(out["e-9"]["billId"], "netflix")
-        self.assertEqual(out["e-9"]["category"], "subscription")        # merchant rule wins over the bill's own category word
+        self.assertEqual(out["e-9"]["category"], "streaming")           # a joined bill's category wins over the merchant rule
         self.assertEqual(out["e-9"]["suggested"], "")
         comed = [t for k, t in out.items() if k != "e-9"][0]
         self.assertEqual((comed["billId"], comed["category"], comed["suggested"]), ("comed", "utility", "necessary"))
