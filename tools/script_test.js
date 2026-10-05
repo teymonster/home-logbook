@@ -89,6 +89,8 @@ test("parseChaseAlert reads amount and merchant", () => {
 test("parseZelle reads amount and recipient", () => {
   const z = parseZelle("Money Sent with Zelle® from Your Bank Account", "Hi, You sent $150.00 to Pat Example with Zelle® on 09/29/2026, from your account.");
   assert.deepStrictEqual(z, { amount: 150, recipient: "Pat Example" });
+  const nb = parseZelle("Money Sent with Zelle\u00ae from Your Bank Account", "Hi, You sent $150.00\u00a0to Pat Example  with Zelle\u00ae on 09/29/2026");
+  assert.deepStrictEqual(nb, { amount: 150, recipient: "Pat Example" });
   assert.strictEqual(parseZelle("Available Balance", "nothing here"), null);
 });
 
@@ -109,6 +111,17 @@ test("parseAmazon handles digital orders, refunds and unparsed bodies", () => {
   const u = parseAmazon({ subject: "Ordered 1 item: Clothing" }, "nothing useful $12.00");
   assert.strictEqual(u[0].unparsed, true);
   assert.strictEqual(u[0].orderId, "");
+  // Newer formats: item-named subject with "Total 27.8 USD", digital "Order #:" with "*Grand Total: $3.99", return logistics ignored
+  const n = parseAmazon({ subject: 'Ordered: "Dust Bag Filters"' }, "Order # 111-0000000-0000011 View or edit order https://x * Dust Bag Filters Quantity: 1 Total 27.8 USD");
+  assert.deepStrictEqual([n[0].orderId, n[0].total, n[0].items], ["111-0000000-0000011", 27.8, "Dust Bag Filters"]);
+  const n2 = parseAmazon({ subject: 'Ordered: "Anova Culinary Sous Vide..." and 4 more items' }, "Order # 111-0000000-0000012 * Anova Culinary Sous Vide Quantity: 1 * Mason Jars Quantity: 2 Total 149.5 USD");
+  assert.deepStrictEqual([n2[0].total, n2[0].items], [149.5, "Anova Culinary Sous Vide; 2x Mason Jars"]);
+  const k = parseAmazon({ subject: "Amazon.com order of Some Novel Title." }, "Order Details Order #: D01-0000000-0000013 Placed on Friday Item Subtotal: $3.99 Total Before Tax: $3.99 Tax Collected: $0.00 *Grand Total: $3.99 *The grand total");
+  assert.deepStrictEqual([k[0].orderId, k[0].total, k[0].items], ["D01-0000000-0000013", 3.99, "Some Novel Title"]);
+  assert.deepStrictEqual(parseAmazon({ subject: "Dropoff confirmed for Telescope Bag..." }, "Your return was dropped off."), []);
+  assert.deepStrictEqual(parseAmazon({ subject: "Return request confirmed for Telescope..." }, "x"), []);
+  const f2 = parseAmazon({ subject: "Advance refund issued for Thread Spool...." }, "Return summary Refund subtotal $7.29 Total refund* $7.29 orderId=111-0000000-0000003");
+  assert.deepStrictEqual([f2[0].kind, f2[0].total], ["amazon-refund", -7.29]);
 });
 
 test("parseDoorDash reads merchant, total, last4 and items; order confirmations are a different kind", () => {

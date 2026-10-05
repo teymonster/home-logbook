@@ -822,9 +822,11 @@ var BUDGET_KINDS = {
 };
 
 var CHASE_ALERT_RE = /^You made a \$([\d,]+\.\d{2}) transaction with (.+?)\.?$/i;
-var ZELLE_RE = /You sent \$([\d,]+\.\d{2}) to (.+?) with Zelle/i;
-var AMZ_ORDER_RE = /Order\s*#\s*([A-Z0-9]{3}-\d{7}-\d{7})[\s\S]{0,600}?(?:Grand Total|Order Total|Total)\s*:?\s*\$?\s*([\d,]+\.\d{2})/gi;
-var AMZ_REFUND_RE = /\$([\d,]+\.\d{2}) will be (?:credited|refunded)/i;
+var ZELLE_RE = /You sent\s+\$([\d,]+\.\d{2})\s+to\s+(.+?)\s+with Zelle/i;   // \s: USAA puts a no-break space after the amount
+// Order blocks: "Order # 111-… Grand Total: 22.44 USD", "Order #: D01-… *Grand Total: $3.99", "Order # 111-… * Item Quantity: 1 Total 27.8 USD"
+var AMZ_ORDER_RE = /Order\s*#\s*:?\s*([A-Z0-9]{3}-\d{7}-\d{7})([\s\S]{0,900}?)(?:Grand Total|Order Total|Total)\s*:?\s*\$?\s*([\d,]+(?:\.\d{1,2})?)\s*(?:USD)?/gi;
+var AMZ_ITEM_RE = /\*\s*([^*\n]{2,120}?)\s+Quantity:\s*(\d+)/g;
+var AMZ_REFUND_RE = /\$([\d,]+\.\d{2}) (?:will be|has been|was) (?:credited|refunded|issued)|(?:refund(?: total)?|total refund)\*?\s*:?\s*\$([\d,]+\.\d{2})/i;
 var DD_ITEM_RE = /(\d+)x\s+([^$]{2,90}?)\s+\$(\d+\.\d{2})/g;
 
 function parseChaseAlert(subject) {
@@ -843,19 +845,27 @@ function parseZelle(subject, body) {
 // "Order # … Grand Total: 22.44 USD" block per order. Digital orders: "Amazon.com order of <title>".
 function parseAmazon(meta, body) {
   var subj = s(meta.subject), out = [], m;
+  // Return logistics (drop-off, return request, pickup) are not money; the refund email is.
+  if (/dropoff|drop-off|return request|return received|pickup|pick-up|label/i.test(subj) && !/refund/i.test(subj)) return [];
   if (/refund/i.test(subj)) {
     var rm = AMZ_REFUND_RE.exec(body), om = /orderId=([A-Z0-9]{3}-\d{7}-\d{7})/.exec(body);
-    var item = (/refund issued for (.+?)\.{0,3}$/i.exec(subj) || [])[1] || "";
-    return [{ kind: "amazon-refund", merchant: "Amazon refund", total: rm ? -Number(rm[1].replace(/,/g, "")) : null,
+    var item = (/refund issued for (.+?)\.*$/i.exec(subj) || [])[1] || "";
+    return [{ kind: "amazon-refund", merchant: "Amazon refund", total: rm ? -Number((rm[1] || rm[2]).replace(/,/g, "")) : null,
               orderId: om ? om[1] : "", categories: "", items: item.slice(0, 200) }];
   }
   var cats = (/^Ordered \d+ items?:\s*(.+)$/i.exec(subj) || [])[1] || "";
   cats = cats.replace(/,?\s*and more$/i, "").trim();
   var digital = (/order of (.+?)\.{0,3}$/i.exec(subj) || [])[1] || "";
+  // Newer subjects name the item: Ordered: "Dust Bag Filters" and 4 more items
+  var named = (/^Ordered:\s*\d*\s*"(.+?)"(?:\s*and (\d+) more items?)?/i.exec(subj) || []);
   AMZ_ORDER_RE.lastIndex = 0;
   while ((m = AMZ_ORDER_RE.exec(body)) !== null) {
-    out.push({ kind: "amazon", merchant: digital ? "Amazon digital" : "Amazon", total: Number(m[2].replace(/,/g, "")),
-               orderId: m[1], categories: digital ? "Digital" : cats, items: digital.slice(0, 200) });
+    var items = [], im;
+    AMZ_ITEM_RE.lastIndex = 0;
+    while ((im = AMZ_ITEM_RE.exec(m[2])) !== null && items.length < 12) items.push((im[2] !== "1" ? im[2] + "x " : "") + im[1].trim());
+    var itemText = digital || items.join("; ") || (named[1] ? named[1] + (named[2] ? " and " + named[2] + " more" : "") : "");
+    out.push({ kind: "amazon", merchant: digital ? "Amazon digital" : "Amazon", total: Number(m[3].replace(/,/g, "")),
+               orderId: m[1], categories: digital ? "Digital" : cats, items: itemText.slice(0, 300) });
   }
   if (!out.length) {
     out.push({ kind: "amazon", merchant: digital ? "Amazon digital" : "Amazon", total: extractAmount(body, null),
@@ -913,7 +923,7 @@ function scanBudget(opts) {
   for (k in rc) if (k.indexOf("__") !== 0) { if (rc[k].gmailId) seen[rc[k].gmailId] = true; if (k.indexOf("r-") === 0) seen[k.slice(2)] = true; }
   for (k in tx) if (k.indexOf("e-") === 0) seen[k.slice(2)] = true;
 
-  var added = [], warnings = [], checked = 0, dup = 0, truncated = [], txDirty = false, rcDirty = false;
+  var added = [], warnings = [], checked = 0, dup = 0, ignored = 0, truncated = [], txDirty = false, rcDirty = false;
   kinds.forEach(function (kind) {
     var def = BUDGET_KINDS[kind];
     var ids = gmailSearch(def.q + " " + window, max);
@@ -938,6 +948,7 @@ function scanBudget(opts) {
         txDirty = true; added.push({ id: "e-" + id, kind: kind, date: meta.date, amount: z.amount, merchant: "Zelle to " + z.recipient });
       } else {
         var recs = kind === "amazon" ? parseAmazon(meta, body) : kind === "doordash" ? [parseDoorDash(meta, body)] : [parseUber(meta, body)];
+        if (!recs.length) { ignored++; return; }
         recs.forEach(function (r) {
           var rid = (r.kind === "amazon" && r.orderId) ? "a-" + r.orderId : "r-" + id;
           if (rc[rid] && rc[rid].gmailId !== id) { dup++; return; }       // same order confirmed twice
@@ -960,7 +971,7 @@ function scanBudget(opts) {
       setProp("LAST_BUDGET_SCAN", now);
     } finally { lock.releaseLock(); }
   } else if (!dry) setProp("LAST_BUDGET_SCAN", now);
-  return { ok: true, dry: dry, window: window, kinds: kinds, checked: checked, added: added, skipped: { dup: dup },
+  return { ok: true, dry: dry, window: window, kinds: kinds, checked: checked, added: added, skipped: { dup: dup, ignored: ignored },
            truncated: truncated, warnings: warnings, lastBudgetScan: now };
 }
 
