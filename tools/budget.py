@@ -186,7 +186,7 @@ DEFAULT_RULES = {
         {"re": r"NAILS|SPA |SPA$|SALON|BARBER|MASSAGE|HAIR|OMNILUX|SEPHORA|ULTA", "category": "personal", "suggested": ""},
         {"re": r"NETFLIX|HULU|SPOTIFY|PARAMOUNT|PEACOCK|DISNEY|APPLE\.COM/BILL|CURIOSITY|MIDJOURNEY|OPENAI|CHATGPT|GODADDY|OURPACT|PLUME|ROOST|EHARMONY|BARK TECHNOLOGIES|OUR FAMILY WIZARD|WALMART\+|ADOBE|INTUIT|PLAUD|MIRANTIS|PATREON|SUBSTACK|YOUTUBE|GOOGLE \*|MICROSOFT", "category": "subscription", "suggested": ""},
         {"re": r"FITNESS DEPOT", "category": "membership", "suggested": "unnecessary"},
-        {"re": r"LTF\*LIFE TIME MO DUES", "category": "membership", "suggested": "necessary"},
+        {"re": r"LTF\*LIFE TIME MO DUE", "category": "membership", "suggested": "necessary"},
         {"re": r"LIFE TIME|LIFETIME|LTFITNESS|PLANET FIT|YMCA", "category": "membership", "suggested": ""},
         {"re": r"NSSD112|NORTH SHORE SCHOOL|SCHOOL|CAMP |ART CENTER|IMPERISOFT|ACTIVE NETWORK|QUINLAN AND FABISH|FIVE BELOW|LEARNING|TUTOR|SCOUTS", "category": "kids", "suggested": "necessary"},
         {"re": r"ALASKA AIR|SOUTHWES|UNITED|DELTA|AMERICAN AIR|PRICELN|HOTEL|HTL|INN |INN$|LODGE|RESORT|MARRIOTT|HILTON|HYATT|AIRBNB|VRBO|CAMPING|CAMPGROUND|AMTRAK|HEADOUT|EXPEDIA|TRIPADVISOR|HERTZ|ENTERPRISE RENT|NIAGARA", "category": "travel", "suggested": ""},
