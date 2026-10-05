@@ -32,7 +32,7 @@
  * typo in the Sheet can never cause rows to be dropped.
  */
 
-var VERSION = 11;
+var VERSION = 12;
 var CADENCES = ["weekly", "monthly", "bimonthly", "quarterly", "semiannual", "annual"];
 var SCAN_DAYS = 40;             // default look-back for the daily / on-demand scan
 var SCAN_MIN_GAP_MS = 5 * 60 * 1000;
@@ -111,6 +111,10 @@ function doPost(e) {
   var body;
   try { body = JSON.parse(e.postData.contents); } catch (err) { return out({ ok: false, error: "bad json" }); }
   if (!authorized(body.token)) return out({ ok: false, error: "unauthorized" });
+  // Owner-only: body.force with the admin token lets a push replace Sheet-owned columns (tag, note,
+  // category, target) for the rows it sends. The page never has the admin token.
+  var force = body.force === true && adminAuthorized(body.admin);
+  if (body.force === true && !force) return out({ ok: false, error: "force needs the admin token" });
 
   var scanInfo = null;
   if (body.scan) {
@@ -146,7 +150,7 @@ function doPost(e) {
       if (!body[name] || typeof body[name] !== "object") continue;
       var cur = readAll(name);
       if (cur.__unreadable) return out({ ok: false, error: "unreadable " + name + " rows: " + cur.__unreadable.join(", ") });
-      var m = merge(name, cur, body[name]);
+      var m = merge(name, cur, body[name], force);
       writeAll(name, m);
       resp[name] = body.quiet ? { rows: Object.keys(m).length } : m;
     }
@@ -213,7 +217,7 @@ function writeAll(name, obj) {
   }
 }
 
-function merge(name, current, incoming) {
+function merge(name, current, incoming, force) {
   var c = COLLECTIONS[name], normalize = c.normalize;
   var merged = {}, id;
   for (id in current) if (id.indexOf("__") !== 0) merged[id] = current[id];
@@ -225,7 +229,7 @@ function merge(name, current, incoming) {
     if (cur && stamp(v) <= stamp(cur)) continue;        // strict: a tie keeps the Sheet's row
     // Sheet-owned columns (Beck's tags, notes, overrides): a filled cell is never overwritten
     // by a push, however new its stamp. Clearing the cell in the Sheet lets the next push fill it.
-    if (cur && !cur.del && !v.del && c.owned) {
+    if (cur && !cur.del && !v.del && c.owned && !force) {
       c.owned.forEach(function (f) { if (s(cur[f]) !== "") v[f] = cur[f]; });
     }
     merged[id] = v;

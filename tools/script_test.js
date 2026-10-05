@@ -222,6 +222,16 @@ test("POST merges budget collections only when sent, and quiet returns counts", 
   const r = JSON.parse(doPost({ postData: { contents: JSON.stringify(body) } }).text);
   assert.deepStrictEqual(r.transactions, { rows: 1 });
   assert.ok(!("receipts" in r) && !("budget" in r));
+  // force: only with the admin token, and then Sheet-owned columns are replaced for the rows sent
+  const tagged = { token: props.TOKEN, transactions: { "c-1": { date: "2026-09-01", merchant: "JEWEL", amount: 80, account: "chase", source: "csv", tag: "skip", u: "2026-10-02T00:00:00.000Z" } } };
+  doPost({ postData: { contents: JSON.stringify(tagged) } });
+  assert.strictEqual(readAll("transactions")["c-1"].tag, "skip");
+  const plain = JSON.parse(doPost({ postData: { contents: JSON.stringify(Object.assign({}, tagged, { transactions: { "c-1": Object.assign({}, tagged.transactions["c-1"], { tag: "necessary", u: "2026-10-03T00:00:00.000Z" }) } })) } }).text);
+  assert.strictEqual(readAll("transactions")["c-1"].tag, "skip", "without force the Sheet keeps its tag");
+  const noAdmin = JSON.parse(doPost({ postData: { contents: JSON.stringify(Object.assign({}, tagged, { force: true })) } }).text);
+  assert.strictEqual(noAdmin.ok, false);
+  doPost({ postData: { contents: JSON.stringify(Object.assign({}, tagged, { force: true, admin: props.ADMIN_TOKEN, transactions: { "c-1": Object.assign({}, tagged.transactions["c-1"], { tag: "necessary", u: "2026-10-04T00:00:00.000Z" }) } })) } });
+  assert.strictEqual(readAll("transactions")["c-1"].tag, "necessary", "force with the admin token replaces the tag");
   const again = JSON.parse(doPost({ postData: { contents: JSON.stringify({ token: props.TOKEN, log: {} }) } }).text);
   assert.ok(!("transactions" in again));
   assert.strictEqual(readAll("transactions")["c-1"].merchant, "JEWEL");

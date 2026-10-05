@@ -98,7 +98,7 @@ class Matching(unittest.TestCase):
     def run_match(self, sh, csvrows):
         rows = {B.csv_id(r.get("account", "chase"), r, 1): dict(r, account=r.get("account", "chase")) for r in csvrows}
         csvdata = {"rows": rows, "coverage": {"chase": ["2026-01-01", "2026-09-30"]}}
-        return B.Matcher(sh, csvdata, self.r).run()
+        return B.Matcher(sh, csvdata, self.r).run()[:3]
 
     def test_statement_line_enriches_the_alert_row_instead_of_duplicating(self):
         sh = sheet(transactions={"e-1": tx("2026-09-29", "AMAZON MKTPLACE PMTS", 44.64, gmailId="1")})
@@ -178,6 +178,35 @@ class Matching(unittest.TestCase):
                                               csvrow("2026-09-02", "ACME PAYROLL FT", -5000.0, account="usaa")])
         cats = sorted((t["category"], t["suggested"]) for t in out.values())
         self.assertEqual(cats, [("income", ""), ("transfer", "skip")])
+
+
+class CombinedAndTips(unittest.TestCase):
+    def setUp(self):
+        Matching.setUp(self)
+
+    def test_combined_doordash_line_links_its_alerts_and_is_retired(self):
+        sh = sheet(transactions={"e-1": tx("2026-07-09", "DD *DOORDASH PANERAB", 40.00, gmailId="1"),
+                                 "e-2": tx("2026-07-10", "DD *DOORDASH MCDONAL", 61.83, gmailId="2")})
+        rows = {B.csv_id("chase", r, 1): dict(r, account="chase") for r in [csvrow("2026-07-11", "DOORDASH*07/10-2 ORDER 855-431-0459 CA", 101.83)]}
+        out, _, notes, _ = B.Matcher(sh, {"rows": rows, "coverage": {"chase": ["2026-01-01", "2026-09-30"]}}, self.r).run()
+        self.assertTrue(out["e-1"]["csv"] and out["e-2"]["csv"])
+        self.assertIn("posted inside the combined DoorDash charge $101.83", out["e-1"]["detail"])
+        self.assertEqual(out["e-1"]["suggested"], "unnecessary")
+        comb = [t for k, t in out.items() if k.startswith("c-")][0]
+        self.assertEqual(comb["suggested"], "skip")
+        self.assertIn("combined posting of 2 orders", comb["detail"])
+        self.assertEqual(len(notes["combined"]), 1)
+
+    def test_tip_sized_difference_merges_and_retires_the_statement_row(self):
+        cid = B.csv_id("chase", csvrow("2026-06-06", "TST*CAFE DACHA Highland Park IL", 138.85), 1)
+        sh = sheet(transactions={"e-1": tx("2026-06-06", "CAFE DACHA", 106.81, gmailId="1"),
+                                 cid: dict(tx("2026-06-06", "TST*CAFE DACHA Highland Park IL", 138.85, source="csv", csv=True, gmailId=""))})
+        rows = {cid: dict(csvrow("2026-06-06", "TST*CAFE DACHA Highland Park IL", 138.85), account="chase")}
+        out, _, _, tomb = B.Matcher(sh, {"rows": rows, "coverage": {"chase": ["2026-01-01", "2026-09-30"]}}, self.r).run()
+        self.assertEqual(list(out), ["e-1"])
+        self.assertEqual(out["e-1"]["amount"], 138.85)
+        self.assertEqual(out["e-1"]["category"], "dining")
+        self.assertEqual(tomb, {cid: {"del": True}})
 
 
 class Diff(unittest.TestCase):

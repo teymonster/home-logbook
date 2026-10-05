@@ -121,9 +121,12 @@ def sheet_get():
     return j
 
 
-def sheet_post(body):
-    c = cfg()
+def sheet_post(body, force=False):
+    c = cfg(admin=force)
     body = dict(body, token=c["token"], quiet=True)
+    if force:
+        body["force"] = True
+        body["admin"] = c["admin"]
     j = http_json(c["url"], data=json.dumps(body).encode("utf-8"))
     if not j.get("ok"):
         die("POST failed: %s" % j.get("error"))
@@ -149,6 +152,22 @@ def save_cache(name, obj):
     p = os.path.join(CACHE, name)
     json.dump(obj, open(p, "w"), indent=1, sort_keys=True)
     return p
+
+
+LEDGER = "tool-tags.json"
+
+
+def ledger_load():
+    return load_cache(LEDGER, required=False) or {}
+
+
+def ledger_record(rows):
+    """Remember tag values the tool wrote, per transaction id."""
+    led = ledger_load()
+    for k, t in rows.items():
+        if t.get("tag"):
+            led[k] = t["tag"]
+    save_cache(LEDGER, led)
 
 
 def live(coll):
@@ -610,6 +629,7 @@ class Matcher:
         self.csv = csvdata["rows"] if csvdata else {}
         self.coverage = csvdata["coverage"] if csvdata else {}
         self.receipt_links = {}
+        self.tombstones = {}                          # Sheet rows superseded by a merge
         self.notes = collections.defaultdict(list)   # diagnostics for the report
 
     # -- step 1: statement lines -------------------------------------------------------------
@@ -657,19 +677,23 @@ class Matcher:
                 if abs(days(t["date"], row["date"])) > 4 or overlap(t["merchant"], row["merchant"]) == 0:
                     continue
                 diff = abs(row["amount"] - t["amount"])
-                if diff > max(3.0, 0.15 * abs(t["amount"])):
+                if diff > max(3.0, 0.40 * abs(t["amount"])):   # tips run 15-30%; the merchant tokens already agree
                     continue
                 if best is None or diff < best[0]:
                     best = (diff, c)
             if best:
                 c = best[1]
                 row = self.tx.pop(c)
+                if c in self.sheet_tx:
+                    self.tombstones[c] = {"del": True}
                 used.add(k); used.add(c)
                 t.update(csv=True, amount=row["amount"], _csvCat=row.get("_csvCat", ""), _orderId=row.get("_orderId", ""),
                          detail=("alert %s, posted %s. " % (money(t["amount"]), money(row["amount"]))))
                 self.notes["adjusted"].append((k, t["merchant"], row["amount"]))
                 continue
             # Inside the statement window but not on the statement: pending or reversed.
+            if t.get("_combined"):
+                continue
             cov = self.coverage.get(t.get("account"))
             if cov and cov[0] <= t["date"] <= (d(cov[1]) - dt.timedelta(days=3)).isoformat():
                 t["detail"] = "not on the statement (pending, declined or reversed?)"
@@ -696,6 +720,41 @@ class Matcher:
             if hit and hit in self.bills:
                 t["billId"] = hit
                 self.notes["billed"].append(k)
+
+    # -- step 2b: combined postings ----------------------------------------------------------------------
+    # DoorDash sometimes posts several orders as one line, "DOORDASH*10/01-2 ORDER". The individual
+    # alerts then look unposted. When a subset of nearby unposted alerts sums to the line, the alerts
+    # become the spend rows (they carry the restaurant) and the combined line is retired as a duplicate.
+    COMBINED_RE = re.compile(r"DOORDASH\*\d\d/\d\d-(\d+) ORDER", re.I)
+
+    def apply_combined(self):
+        pending = [k for k, t in self.tx.items() if t.get("source") == "alert" and not t.get("csv") and DD_RE.search(t["merchant"])]
+        combined = sorted(((k, t) for k, t in self.tx.items() if self.COMBINED_RE.search(t["merchant"]) and t["amount"] > 0), key=lambda kv: kv[1]["date"])
+        for ck, c in combined:
+            cands = [k for k in pending if -6 <= days(self.tx[k]["date"], c["date"]) <= 1]
+            hit = None
+            for size in range(1, min(5, len(cands)) + 1):
+                for combo in itertools.combinations(cands, size):
+                    if abs(sum(self.tx[k]["amount"] for k in combo) - c["amount"]) < 0.011:
+                        hit = combo
+                        break
+                if hit:
+                    break
+            if not hit:
+                continue
+            for k in hit:
+                pending.remove(k)
+                t = self.tx[k]
+                if t.get("detail", "").startswith("not on the statement"):
+                    t["detail"] = ""
+                    t["suggested"] = ""
+                    self.notes["notOnStatement"] = [n for n in self.notes.get("notOnStatement", []) if n[0] != k]
+                t["csv"] = True
+                t["_combined"] = ck
+                t["detail"] = "posted inside the combined DoorDash charge %s on %s (%s orders). " % (money(c["amount"]), c["date"], self.COMBINED_RE.search(c["merchant"]).group(1))
+            c["detail"] = "combined posting of %d orders, counted on their alert rows: %s" % (len(hit), ", ".join(self.tx[k]["merchant"][:24] for k in hit))
+            c["_force_skip"] = True
+            self.notes["combined"].append((ck, c["date"], c["amount"], len(hit)))
 
     # -- step 3: DoorDash / Uber -------------------------------------------------------------------
     def apply_delivery(self):
@@ -859,6 +918,9 @@ class Matcher:
                 sug = sug or rsug or tag_ok(self.r["categories"].get(t["category"], ""))
             if t.get("suggested") in ("skip",) and t.get("detail", "").startswith("not on the statement"):
                 sug = "skip"
+            if t.pop("_force_skip", False):
+                sug = "skip"
+            t.pop("_combined", None)
             if t["amount"] < 0 and t["category"] not in ("income", "transfer"):
                 sug = sug or ""  # credits net against their category; no nag
             t["suggested"] = "" if t.get("tag") else tag_ok(sug)   # a tagged row needs no suggestion
@@ -867,11 +929,12 @@ class Matcher:
 
     def run(self):
         self.apply_csv()
+        self.apply_combined()
         self.apply_bills()
         self.apply_delivery()
         self.apply_amazon()
         self.finalize()
-        return self.tx, self.receipt_links, self.notes
+        return self.tx, self.receipt_links, self.notes, self.tombstones
 
 
 def diff_rows(proposed, current):
@@ -905,8 +968,9 @@ def cmd_match(_args):
     if not csvdata:
         print("no csv.json yet (run ingest); matching alerts and receipts only")
     r = rules()
-    tx, links, notes = Matcher(sheet, csvdata, r).run()
+    tx, links, notes, tombstones = Matcher(sheet, csvdata, r).run()
     to_push = diff_rows(tx, live(sheet["transactions"]))
+    to_push.update(tombstones)
     receipts = {}
     for rid, k in links.items():
         rc = sheet["receipts"].get(rid)
@@ -931,18 +995,52 @@ def cmd_match(_args):
 def cmd_push(args):
     guard_repo()
     prop = load_cache("proposed.json")
+    sheet = load_cache("sheet.json")
+    cur = live(sheet["transactions"])
     stamp = now_iso()
     rows = {k: dict(v, u=stamp) for k, v in prop["push"].items()}
     for row in rows.values():
+        if row.get("del"):
+            continue
         row["tag"] = ""      # never pushed: the Sheet owns them (a filled cell survives, an empty one stays empty)
         row["note"] = ""
+    retag = {}
+    if getattr(args, "retag", False):
+        if sheet.get("version", 0) < 12 and not args.dry:
+            die("--retag needs Apps Script v12 deployed (forced owned columns); the endpoint is v%s" % sheet.get("version"))
+        led = ledger_load()
+        for k, t in prop["transactions"].items():
+            c = cur.get(k)
+            if not c or not c.get("tag") or led.get(k) != c["tag"]:
+                continue                       # untagged, or a tag Beck set or changed: never touched
+            want = t.get("suggested") or ""
+            if t.get("detail", "").startswith("posted inside the combined") and not want:
+                want = ""                      # becomes an ordinary untagged row again
+            if want != c["tag"] or (not want and c["tag"] == "skip" and not t.get("detail", "").startswith("not on the statement") and t.get("category") != "transfer"):
+                retag[k] = dict(t, tag=want, suggested="", note=c.get("note", ""), u=stamp)
+        print("retag: %d rows whose tool-written tag no longer matches (%s)" % (len(retag), dict(collections.Counter((cur[k]["tag"] + "→" + (v["tag"] or "untagged")) for k, v in retag.items()))))
     receipts = {k: dict(v, u=stamp) for k, v in prop["receipts"].items()}
     budget = {k: dict(v, u=stamp) for k, v in prop["budget"].items()}
     print("push: %d transactions, %d receipt links, %d budget seeds%s" % (len(rows), len(receipts), len(budget), " (DRY)" if args.dry else ""))
     if args.dry:
         for k, v in list(rows.items())[:15]:
             print("  %s %s %-32s %10s %-12s sug=%-11s %s" % (k, v["date"], v["merchant"][:32], money(v["amount"]), v["category"], v["suggested"], v["detail"][:60]))
+        for k, v in list(retag.items())[:15]:
+            print("  retag %s %s %-28s %9s %s→%s %s" % (k, v["date"], v["merchant"][:28], money(v["amount"]), cur[k]["tag"], v["tag"] or "untagged", v["detail"][:50]))
         return
+    if retag:
+        ids = list(retag)
+        for i in range(0, len(ids), BATCH):
+            sheet_post({"transactions": {k: retag[k] for k in ids[i:i + BATCH]}}, force=True)
+        led = ledger_load()
+        for k, v in retag.items():
+            if v["tag"]:
+                led[k] = v["tag"]
+            else:
+                led.pop(k, None)
+        save_cache(LEDGER, led)
+        print("  retagged %d rows" % len(retag))
+        rows = {k: v for k, v in rows.items() if k not in retag}
     ids = list(rows)
     for i in range(0, len(ids), BATCH):
         chunk = {k: rows[k] for k in ids[i:i + BATCH]}
@@ -977,6 +1075,7 @@ def cmd_accept_suggestions(args):
     for i in range(0, len(ids), BATCH):
         sheet_post({"transactions": {k: rows[k] for k in ids[i:i + BATCH]}})
         print("  %d-%d written" % (i + 1, min(i + BATCH, len(ids))))
+    ledger_record(rows)
     cmd_pull(args)
 
 
@@ -1009,6 +1108,7 @@ def cmd_tag(args):
     ids = list(rows)
     for i in range(0, len(ids), BATCH):
         sheet_post({"transactions": {k: rows[k] for k in ids[i:i + BATCH]}})
+    ledger_record(rows)
     cmd_pull(args)
 
 
@@ -1255,6 +1355,7 @@ def main(argv=None):
     sub.add_parser("ingest")
     sub.add_parser("match")
     p = sub.add_parser("push"); p.add_argument("--dry", action="store_true")
+    p.add_argument("--retag", action="store_true", help="with the admin token: rows whose tag the tool wrote get the new suggestion as their tag")
     rp = sub.add_parser("report"); rp.add_argument("--months", type=int, default=12)
     rs = sub.add_parser("rescan-receipts"); rs.add_argument("--dry", action="store_true")
     ac = sub.add_parser("accept-suggestions"); ac.add_argument("--dry", action="store_true")
