@@ -223,7 +223,13 @@ DEFAULT_RULES = {
         "Books": "unnecessary", "Digital": "unnecessary", "Electronics": "", "Kitchen": "", "Beauty": "", "Sports": ""
     },
     "doordash": {"Target": "necessary", "Jewel-Osco": "necessary", "Walgreens": "necessary", "CVS": "necessary", "Aldi": "necessary",
-                 "Mariano's": "necessary", "Costco": "necessary", "Whole Foods": "necessary"}
+                 "Mariano's": "necessary", "Costco": "necessary", "Whole Foods": "necessary"},
+    "amazonItems": {"necessary": ["filter", "vacuum", "plumb", "faucet", "bulb", "battery", "detergent", "trash bag", "toilet", "paper towel",
+                                  "toothpaste", "shampoo", "vitamin", "medicine", "first aid", "smoke", "carbon monoxide", "furnace", "humidifier",
+                                  "dehumidifier", "thermostat", "school", "backpack", "notebook", "pencil", "printer", "ink", "dog food", "cat food", "litter"],
+                    "unnecessary": ["romance", "novel", "book", "hoodie", "shirt", "shoe", "boot", "sneaker", "converse", "earring", "jewelry",
+                                    "crochet", "craft", "toy", "game", "fuggler", "decor", "candle", "pre-workout", "supplement", "telescope", "costume",
+                                    "lego", "plush", "poster"]}
 }
 
 
@@ -509,7 +515,8 @@ def cmd_rescan_receipts(args):
     guard_repo()
     sheet = load_cache("sheet.json")
     rc = live(sheet["receipts"])
-    todo = {k: v for k, v in rc.items() if v["kind"] in ("amazon", "amazon-refund") and (not v.get("orderId") or v.get("total") is None)}
+    todo = {k: v for k, v in rc.items() if v["kind"] in ("amazon", "amazon-refund")
+            and (not v.get("orderId") or v.get("total") is None or (v["kind"] == "amazon" and not v.get("categories") and not v.get("items")))}
     print("%d Amazon receipts to re-read%s" % (len(todo), " (DRY)" if args.dry else ""))
     stamp = now_iso()
     new_rows, tombstones, still = {}, {}, []
@@ -532,7 +539,7 @@ def cmd_rescan_receipts(args):
         for r in recs:
             nid = "a-" + r["orderId"] if r["kind"] == "amazon" and r["orderId"] else rid
             new_rows[nid] = {"kind": r["kind"], "date": v["date"], "merchant": r["merchant"], "total": r["total"], "orderId": r["orderId"],
-                             "categories": r["categories"], "items": r["items"], "last4": "", "gmailId": gid, "txId": "", "u": stamp}
+                             "categories": r["categories"], "items": r["items"], "last4": "", "gmailId": gid, "txId": v.get("txId", "") if nid == rid else "", "u": stamp}
         if rid not in new_rows:
             tombstones[rid] = {"del": True, "u": stamp}
         if args.dry and i < 8:
@@ -621,8 +628,8 @@ class Matcher:
             t = self.tx[k]
             best = None
             for c in fresh:
-                row = self.tx[c]
-                if row.get("account") != t.get("account") or c in used:
+                row = self.tx.get(c)
+                if row is None or row.get("account") != t.get("account") or c in used:
                     continue
                 if abs(days(t["date"], row["date"])) > 4 or overlap(t["merchant"], row["merchant"]) == 0:
                     continue
@@ -683,7 +690,7 @@ class Matcher:
                 if t.get("_rcpt") or k in used or not fam.search(t["merchant"]) or t["amount"] <= 0:
                     continue
                 gap = days(r["date"], t["date"])
-                if gap < -1 or gap > 4:
+                if gap < -3 or gap > 5:
                     continue
                 diff = abs(t["amount"] - r["total"])
                 exact = diff < 0.011
@@ -784,16 +791,30 @@ class Matcher:
                 return tag_ok(tag)
         return ""
 
-    def link_amazon(self, rid, r, chosen, exact_order):
+    def amazon_suggestion(self, r):
         first_cat = (r.get("categories") or "").split(",")[0].strip()
         sug = tag_ok(self.r["amazonCategory"].get(first_cat, ""))
-        for i, k in enumerate(chosen):
+        if not sug and r.get("items"):
+            low = r["items"].lower()
+            for tag, words in self.r.get("amazonItems", {}).items():
+                if any(w in low for w in words):
+                    return tag_ok(tag)
+        return sug
+
+    def link_amazon(self, rid, r, chosen, exact_order):
+        sug = self.amazon_suggestion(r)
+        charges = [k for k in chosen if self.tx[k]["amount"] > 0]
+        for k in chosen:
             t = self.tx[k]
             t["_rcpt"] = rid
             t["_cat"] = "amazon"
             t["_sug"] = sug
-            t["detail"] = ("order %s: %s%s (%d of %d charges%s)" % (r.get("orderId", ""), r.get("categories") or r["merchant"],
-                           (" — " + r["items"]) if r.get("items") else "", i + 1, len(chosen), "" if exact_order else ", matched by amount"))[:500]
+            what = (r.get("categories") or r["merchant"]) + ((" — " + r["items"]) if r.get("items") else "")
+            if t["amount"] <= 0:
+                t["detail"] = ("refund on order %s: %s" % (r.get("orderId", ""), what))[:500]
+            else:
+                t["detail"] = ("order %s: %s (%d of %d charges%s)" % (r.get("orderId", ""), what, charges.index(k) + 1, len(charges),
+                                                                     "" if exact_order else ", matched by amount"))[:500]
         self.receipt_links[rid] = chosen[0]
 
     # -- step 5: categories + suggestions ----------------------------------------------------------
