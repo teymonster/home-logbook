@@ -433,10 +433,15 @@ def month_windows(months):
 
 def scan_window(kind, after, before, dry):
     """One admin budgetscan; split the window when Gmail truncates it."""
-    j = admin_get(op="budgetscan", kind=kind, after=after, before=before, max=300, dry="1" if dry else "0")
+    for attempt in range(1, 4):
+        j = admin_get(op="budgetscan", kind=kind, after=after, before=before, max=300, dry="1" if dry else "0")
+        if j.get("ok"):
+            break
+        # "unknown op" right after a redeploy means a stale version answered; transient errors also retry.
+        print("  %s %s..%s ERROR %s%s" % (kind, after, before, j.get("error"), " (retrying)" if attempt < 3 else ""))
+        time.sleep(5 * attempt)
     if not j.get("ok"):
-        print("  %s %s..%s ERROR %s" % (kind, after, before, j.get("error")))
-        return {"added": 0, "dup": 0, "warnings": []}
+        return {"added": 0, "dup": 0, "warnings": ["%s %s..%s failed: %s" % (kind, after, before, j.get("error"))]}
     added, dup = len(j.get("added", [])), j.get("skipped", {}).get("dup", 0)
     print("  %-8s %s..%s  checked %3d  added %3d  dup %3d%s" % (kind, after, before, j.get("checked", 0), added, dup, "  TRUNCATED" if j.get("truncated") else ""))
     res = {"added": added, "dup": dup, "warnings": j.get("warnings", [])}
@@ -463,6 +468,89 @@ def cmd_backfill(args):
     print("done: added %d, already present %d, warnings %d" % (total["added"], total["dup"], len(warnings)))
     for w in warnings[:40]:
         print("  warn:", w)
+
+
+# ------------------------------------------------------------------------------------ receipt repair
+
+AMZ_ORDER_PY = re.compile(r"Order\s*#\s*:?\s*([A-Z0-9]{3}-\d{7}-\d{7})([\s\S]{0,900}?)(?:Grand Total|Order Total|Total)\s*:?\s*\$?\s*([\d,]+(?:\.\d{1,2})?)\s*(?:USD)?", re.I)
+AMZ_ITEM_PY = re.compile(r"\*\s*([^*\n]{2,120}?)\s+Quantity:\s*(\d+)")
+AMZ_REFUND_PY = re.compile(r"\$([\d,]+\.\d{2}) (?:will be|has been|was) (?:credited|refunded|issued)|(?:refund(?: total)?|total refund)\*?\s*:?\s*\$([\d,]+\.\d{2})", re.I)
+
+
+def parse_amazon_py(subject, body):
+    """Python twin of the script's parseAmazon, for repairing receipts the deployed version mis-read."""
+    subj = subject.strip()
+    if re.search(r"dropoff|drop-off|return request|return received|pickup|pick-up|label", subj, re.I) and not re.search(r"refund", subj, re.I):
+        return []
+    if re.search(r"refund", subj, re.I):
+        rm = AMZ_REFUND_PY.search(body)
+        om = re.search(r"orderId=([A-Z0-9]{3}-\d{7}-\d{7})", body)
+        item = (re.search(r"refund issued for (.+?)\.*$", subj, re.I) or [None, ""])[1]
+        total = -float((rm.group(1) or rm.group(2)).replace(",", "")) if rm else None
+        return [{"kind": "amazon-refund", "merchant": "Amazon refund", "total": total, "orderId": om.group(1) if om else "", "categories": "", "items": item[:200]}]
+    cats = (re.search(r"^Ordered \d+ items?:\s*(.+)$", subj, re.I) or [None, ""])[1]
+    cats = re.sub(r",?\s*and more$", "", cats, flags=re.I).strip()
+    digital = (re.search(r"order of (.+?)\.{0,3}$", subj, re.I) or [None, ""])[1]
+    named = re.search(r'^Ordered:\s*\d*\s*"(.+?)"(?:\s*and (\d+) more items?)?', subj, re.I)
+    out = []
+    for m in AMZ_ORDER_PY.finditer(body):
+        items = [(q + "x " if q != "1" else "") + name.strip() for name, q in AMZ_ITEM_PY.findall(m.group(2))][:12]
+        text = digital or "; ".join(items) or ((named.group(1) + (" and %s more" % named.group(2) if named.group(2) else "")) if named else "")
+        out.append({"kind": "amazon", "merchant": "Amazon digital" if digital else "Amazon", "total": float(m.group(3).replace(",", "")),
+                    "orderId": m.group(1), "categories": "Digital" if digital else cats, "items": text[:300]})
+    if not out:
+        out.append({"kind": "amazon", "merchant": "Amazon digital" if digital else "Amazon", "total": None, "orderId": "",
+                    "categories": "Digital" if digital else cats, "items": digital[:200], "unparsed": True})
+    return out
+
+
+def cmd_rescan_receipts(args):
+    """Re-read Amazon receipts that have no order id or no total (older deployed parser) through the peek op."""
+    guard_repo()
+    sheet = load_cache("sheet.json")
+    rc = live(sheet["receipts"])
+    todo = {k: v for k, v in rc.items() if v["kind"] in ("amazon", "amazon-refund") and (not v.get("orderId") or v.get("total") is None)}
+    print("%d Amazon receipts to re-read%s" % (len(todo), " (DRY)" if args.dry else ""))
+    stamp = now_iso()
+    new_rows, tombstones, still = {}, {}, []
+    for i, (rid, v) in enumerate(sorted(todo.items(), key=lambda kv: kv[1]["date"])):
+        gid = v.get("gmailId") or (rid[2:] if rid.startswith("r-") else "")
+        if not gid:
+            still.append((rid, "no gmailId"))
+            continue
+        p = admin_get(op="peek", id=gid)
+        if not p.get("ok"):
+            still.append((rid, p.get("error")))
+            continue
+        recs = parse_amazon_py(p.get("subject", ""), p.get("body", ""))
+        if not recs:
+            tombstones[rid] = {"del": True, "u": stamp}      # return logistics: not money, and stays "seen"
+            continue
+        if any(r.get("unparsed") or r["total"] is None for r in recs):
+            still.append((rid, "unparsed: " + p.get("subject", "")[:60]))
+            continue
+        for r in recs:
+            nid = "a-" + r["orderId"] if r["kind"] == "amazon" and r["orderId"] else rid
+            new_rows[nid] = {"kind": r["kind"], "date": v["date"], "merchant": r["merchant"], "total": r["total"], "orderId": r["orderId"],
+                             "categories": r["categories"], "items": r["items"], "last4": "", "gmailId": gid, "txId": "", "u": stamp}
+        if rid not in new_rows:
+            tombstones[rid] = {"del": True, "u": stamp}
+        if args.dry and i < 8:
+            print("  %s → %s" % (rid, [(r["kind"], r["orderId"], r["total"], r["items"][:40]) for r in recs]))
+        if (i + 1) % 25 == 0:
+            print("  %d read" % (i + 1))
+    print("repaired %d rows, %d placeholders retired, %d still unreadable" % (len(new_rows), len(tombstones), len(still)))
+    for rid, why in still[:30]:
+        print("  still:", rid, why)
+    if args.dry:
+        return
+    body = dict(new_rows)
+    body.update(tombstones)
+    ids = list(body)
+    for i in range(0, len(ids), BATCH):
+        sheet_post({"receipts": {k: body[k] for k in ids[i:i + BATCH]}})
+    print("  pushed")
+    cmd_pull(args)
 
 
 # ------------------------------------------------------------------------------------ match
@@ -1071,10 +1159,12 @@ def main(argv=None):
     sub.add_parser("match")
     p = sub.add_parser("push"); p.add_argument("--dry", action="store_true")
     rp = sub.add_parser("report"); rp.add_argument("--months", type=int, default=12)
+    rs = sub.add_parser("rescan-receipts"); rs.add_argument("--dry", action="store_true")
     rn = sub.add_parser("run"); rn.add_argument("--months", type=int, default=12); rn.add_argument("--dry", action="store_true")
     args = ap.parse_args(argv)
     guard_repo()
-    {"pull": cmd_pull, "backfill": cmd_backfill, "ingest": cmd_ingest, "match": cmd_match, "push": cmd_push, "report": cmd_report, "run": cmd_run}[args.cmd](args)
+    {"pull": cmd_pull, "backfill": cmd_backfill, "ingest": cmd_ingest, "match": cmd_match, "push": cmd_push, "report": cmd_report, "run": cmd_run,
+     "rescan-receipts": cmd_rescan_receipts}[args.cmd](args)
 
 
 if __name__ == "__main__":
