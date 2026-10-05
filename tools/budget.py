@@ -630,17 +630,31 @@ class Matcher:
         self.coverage = csvdata["coverage"] if csvdata else {}
         self.receipt_links = {}
         self.tombstones = {}                          # Sheet rows superseded by a merge
+        self.carried_from = {}                        # alert id -> statement row it inherited a tag from
         self.notes = collections.defaultdict(list)   # diagnostics for the report
 
     # -- step 1: statement lines -------------------------------------------------------------
     def apply_csv(self):
         alerts = [k for k, v in self.tx.items() if v.get("source") in ("alert", "zelle")]
+        # Recompute from the statements every run: the Sheet's posted flags and reconciliation notes
+        # are outputs of this step, not inputs, otherwise a second run reads its own conclusions.
+        for k, t in self.tx.items():
+            det = t.get("detail", "")
+            m = re.search(r"alert \$([\d,]+\.\d{2}), posted", det)
+            if t.get("source") in ("alert", "zelle"):
+                t["csv"] = False
+                t["_alertAmount"] = float(m.group(1).replace(",", "")) if m else t["amount"]   # what Chase alerted, before any tip
+            om = re.search(r"order ([A-Z0-9]{3}-\d{7}-\d{7})", det)
+            if om and not t.get("_orderId"):
+                t["_orderId"] = om.group(1)
+            t["detail"] = ""                     # rebuilt below from statements and receipts
+            if t.get("suggested") == "skip" and t.get("category") != "transfer":
+                t["suggested"] = ""
         used = set()
         for rid, row in sorted(self.csv.items(), key=lambda kv: kv[1]["date"]):
-            if rid in self.tx:
-                t = self.tx[rid]
-                t.update(csv=True, date=row["date"], amount=row["amount"], _csvCat=row["csvCat"], _orderId=row.get("orderId", ""))
-                continue
+            existing = self.tx.get(rid)
+            if existing:
+                existing.update(csv=True, date=row["date"], amount=row["amount"], _csvCat=row["csvCat"], _orderId=row.get("orderId", ""))
             best = None
             for k in alerts:
                 t = self.tx[k]
@@ -657,8 +671,16 @@ class Matcher:
                 used.add(k)
                 self.tx[k]["csv"] = True
                 self.tx[k]["_csvCat"] = row["csvCat"]
+                if self.tx[k]["source"] != "csv" and self.tx[k].get("_alertAmount") not in (None, row["amount"]):
+                    self.tx[k]["detail"] = "alert %s, posted %s. " % (money(self.tx[k]["_alertAmount"]), money(row["amount"]))
                 if row.get("orderId"):
                     self.tx[k]["_orderId"] = row["orderId"]
+                if existing:                      # late alert: it takes over the statement row, tag and note included
+                    self.tx[k]["_carry"] = {"tag": existing.get("tag", ""), "note": existing.get("note", ""), "from": rid}
+                    self.tx.pop(rid)
+                    self.tombstones[rid] = {"del": True}
+                continue
+            if existing:
                 continue
             self.tx[rid] = {"date": row["date"], "merchant": row["desc"], "amount": row["amount"], "account": row["account"], "category": "",
                             "suggested": "", "tag": "", "note": "", "detail": "", "billId": "", "source": "csv", "csv": True, "gmailId": "",
@@ -688,7 +710,7 @@ class Matcher:
                     self.tombstones[c] = {"del": True}
                 used.add(k); used.add(c)
                 t.update(csv=True, amount=row["amount"], _csvCat=row.get("_csvCat", ""), _orderId=row.get("_orderId", ""),
-                         detail=("alert %s, posted %s. " % (money(t["amount"]), money(row["amount"]))))
+                         detail=("alert %s, posted %s. " % (money(t.get("_alertAmount", t["amount"])), money(row["amount"]))))
                 self.notes["adjusted"].append((k, t["merchant"], row["amount"]))
                 continue
             # Inside the statement window but not on the statement: pending or reversed.
@@ -921,7 +943,12 @@ class Matcher:
                 sug = sug or ""  # credits net against their category; no nag
             t["_sug_full"] = tag_ok(sug)                            # what the tool would tag, used by push --retag
             t["suggested"] = "" if t.get("tag") else tag_ok(sug)   # a tagged row needs no visible suggestion
-            t.pop("_rcpt", None); t.pop("_status", None); t.pop("_orderId", None)
+            t.pop("_rcpt", None); t.pop("_status", None); t.pop("_orderId", None); t.pop("_alertAmount", None)
+            t["detail"] = (t.get("detail") or "").strip()[:500]
+            carry = t.pop("_carry", None)
+            if carry and not t.get("tag"):
+                t["tag"], t["note"], t["carry"] = carry["tag"], carry["note"], True
+                self.carried_from[k] = carry["from"]
             t.setdefault("tag", ""); t.setdefault("note", ""); t.setdefault("detail", ""); t.setdefault("billId", ""); t.setdefault("gmailId", "")
 
     def run(self):
@@ -965,7 +992,8 @@ def cmd_match(_args):
     if not csvdata:
         print("no csv.json yet (run ingest); matching alerts and receipts only")
     r = rules()
-    tx, links, notes, tombstones = Matcher(sheet, csvdata, r).run()
+    matcher = Matcher(sheet, csvdata, r)
+    tx, links, notes, tombstones = matcher.run()
     to_push = diff_rows(tx, live(sheet["transactions"]))
     to_push.update(tombstones)
     receipts = {}
@@ -978,7 +1006,8 @@ def cmd_match(_args):
     for c in cats:
         if c not in live(sheet["budget"]) and c not in ("income", "transfer"):
             budget_seed[c] = {"target": None, "note": "set a monthly target"}
-    out = {"transactions": tx, "push": to_push, "receipts": receipts, "budget": budget_seed, "notes": dict(notes), "matched": now_iso()}
+    out = {"transactions": tx, "push": to_push, "receipts": receipts, "budget": budget_seed, "notes": dict(notes), "matched": now_iso(),
+           "carriedFrom": getattr(matcher, "carried_from", {})}
     p = save_cache("proposed.json", out)
     n = len(tx)
     print("%d transactions (%d new/changed to push), %d receipt links, %d budget rows to seed → %s" % (n, len(to_push), len(receipts), len(budget_seed), os.path.relpath(p, ROOT)))
@@ -996,9 +1025,13 @@ def cmd_push(args):
     cur = live(sheet["transactions"])
     stamp = now_iso()
     rows = {k: {f: x for f, x in v.items() if not f.startswith("_")} for k, v in prop["push"].items()}
-    for row in rows.values():
+    carried = {}
+    for k, row in rows.items():
         row["u"] = stamp
         if row.get("del"):
+            continue
+        if row.pop("carry", False) and k not in cur:
+            carried[k] = row.get("tag", "")   # inherited from the statement row it replaces
             continue
         row["tag"] = ""      # never pushed: the Sheet owns them (a filled cell survives, an empty one stays empty)
         row["note"] = ""
@@ -1045,6 +1078,15 @@ def cmd_push(args):
         chunk = {k: rows[k] for k in ids[i:i + BATCH]}
         j = sheet_post({"transactions": chunk})
         print("  transactions %d-%d ok (%s rows in Sheet)" % (i + 1, i + len(chunk), j.get("transactions", {}).get("rows")))
+    if carried:
+        # an inherited tag counts as tool-written only if the retired row's tag was (the ledger says)
+        led = ledger_load()
+        for k, tag in carried.items():
+            src = prop.get("carriedFrom", {}).get(k)
+            if tag and src and led.get(src) == tag:
+                led[k] = tag
+            led.pop(src, None)
+        save_cache(LEDGER, led)
     if receipts:
         rids = list(receipts)
         for i in range(0, len(rids), BATCH):
