@@ -120,6 +120,11 @@ test("parseAmazon handles digital orders, refunds and unparsed bodies", () => {
   assert.deepStrictEqual([k[0].orderId, k[0].total, k[0].items], ["D01-0000000-0000013", 3.99, "Some Novel Title"]);
   assert.deepStrictEqual(parseAmazon({ subject: "Dropoff confirmed for Telescope Bag..." }, "Your return was dropped off."), []);
   assert.deepStrictEqual(parseAmazon({ subject: "Return request confirmed for Telescope..." }, "x"), []);
+  assert.deepStrictEqual(parseAmazon({ subject: "Your return drop off confirmation for Chain..." }, "x"), []);
+  assert.deepStrictEqual(parseAmazon({ subject: "Refund ineligible for Shapewear...." }, "x"), []);
+  assert.deepStrictEqual(parseAmazon({ subject: "Pat sent you printing information about an Amazon.com return" }, "x"), []);
+  const long = parseAmazon({ subject: 'Ordered: "Shoes..." and 5 more items' }, "Order # 111-0000000-0000014 " + "* Item number x Quantity: 1 ".repeat(6) + "x".repeat(1200) + " Total 203.4 USD");
+  assert.deepStrictEqual([long[0].orderId, long[0].total], ["111-0000000-0000014", 203.4]);
   const f2 = parseAmazon({ subject: "Advance refund issued for Thread Spool...." }, "Return summary Refund subtotal $7.29 Total refund* $7.29 orderId=111-0000000-0000003");
   assert.deepStrictEqual([f2[0].kind, f2[0].total], ["amazon-refund", -7.29]);
 });
