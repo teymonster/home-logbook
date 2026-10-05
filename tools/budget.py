@@ -731,7 +731,7 @@ class Matcher:
         pending = [k for k, t in self.tx.items() if t.get("source") == "alert" and not t.get("csv") and DD_RE.search(t["merchant"])]
         combined = sorted(((k, t) for k, t in self.tx.items() if self.COMBINED_RE.search(t["merchant"]) and t["amount"] > 0), key=lambda kv: kv[1]["date"])
         for ck, c in combined:
-            cands = [k for k in pending if -6 <= days(self.tx[k]["date"], c["date"]) <= 1]
+            cands = [k for k in pending if abs(days(self.tx[k]["date"], c["date"])) <= 7]
             hit = None
             for size in range(1, min(5, len(cands)) + 1):
                 for combo in itertools.combinations(cands, size):
@@ -760,10 +760,8 @@ class Matcher:
     def apply_delivery(self):
         order = {"doordash": 0, "uber": 1, "doordash-order": 2}
         recs = sorted(((rid, r) for rid, r in self.receipts.items() if r["kind"] in order), key=lambda kv: (order[kv[1]["kind"]], kv[1]["date"]))
-        used = set(v.get("_rcpt") for v in self.tx.values() if v.get("_rcpt"))
+        used = set()
         for rid, r in recs:
-            if r.get("txId") and r["txId"] in self.tx and not self.tx[r["txId"]].get("_rcpt"):
-                self.tx[r["txId"]]["_rcpt"] = rid   # keep an existing link
             if r.get("total") is None:
                 continue
             fam = DD_RE if r["kind"].startswith("doordash") else UBER_RE
@@ -812,8 +810,6 @@ class Matcher:
                 t["_orderId"] = oid
                 by_order[oid].append(k)
         for rid, r in orders:
-            if r.get("txId") and r["txId"] in self.tx:
-                continue
             keyed = [k for k in by_order.get(r.get("orderId", ""), []) if not amz[k].get("_rcpt")]
             if keyed:
                 self.link_amazon(rid, r, keyed, exact_order=True)
@@ -923,7 +919,8 @@ class Matcher:
             t.pop("_combined", None)
             if t["amount"] < 0 and t["category"] not in ("income", "transfer"):
                 sug = sug or ""  # credits net against their category; no nag
-            t["suggested"] = "" if t.get("tag") else tag_ok(sug)   # a tagged row needs no suggestion
+            t["_sug_full"] = tag_ok(sug)                            # what the tool would tag, used by push --retag
+            t["suggested"] = "" if t.get("tag") else tag_ok(sug)   # a tagged row needs no visible suggestion
             t.pop("_rcpt", None); t.pop("_status", None); t.pop("_orderId", None)
             t.setdefault("tag", ""); t.setdefault("note", ""); t.setdefault("detail", ""); t.setdefault("billId", ""); t.setdefault("gmailId", "")
 
@@ -972,9 +969,9 @@ def cmd_match(_args):
     to_push = diff_rows(tx, live(sheet["transactions"]))
     to_push.update(tombstones)
     receipts = {}
-    for rid, k in links.items():
-        rc = sheet["receipts"].get(rid)
-        if rc and rc.get("txId") != k:
+    for rid, rc in live(sheet["receipts"]).items():
+        k = links.get(rid, "")
+        if rc.get("txId", "") != k:
             receipts[rid] = dict(rc, txId=k)
     budget_seed = {}
     cats = collections.Counter(t["category"] for t in tx.values() if t["category"])
@@ -998,8 +995,9 @@ def cmd_push(args):
     sheet = load_cache("sheet.json")
     cur = live(sheet["transactions"])
     stamp = now_iso()
-    rows = {k: dict(v, u=stamp) for k, v in prop["push"].items()}
+    rows = {k: {f: x for f, x in v.items() if not f.startswith("_")} for k, v in prop["push"].items()}
     for row in rows.values():
+        row["u"] = stamp
         if row.get("del"):
             continue
         row["tag"] = ""      # never pushed: the Sheet owns them (a filled cell survives, an empty one stays empty)
@@ -1013,11 +1011,12 @@ def cmd_push(args):
             c = cur.get(k)
             if not c or not c.get("tag") or led.get(k) != c["tag"]:
                 continue                       # untagged, or a tag Beck set or changed: never touched
-            want = t.get("suggested") or ""
-            if t.get("detail", "").startswith("posted inside the combined") and not want:
-                want = ""                      # becomes an ordinary untagged row again
-            if want != c["tag"] or (not want and c["tag"] == "skip" and not t.get("detail", "").startswith("not on the statement") and t.get("category") != "transfer"):
-                retag[k] = dict(t, tag=want, suggested="", note=c.get("note", ""), u=stamp)
+            want = t.get("_sug_full") or ""
+            if want == c["tag"]:
+                continue
+            if not want and c["tag"] != "skip":
+                continue                       # the tool has no better idea: leave a non-skip tag alone
+            retag[k] = dict({f: x for f, x in t.items() if not f.startswith("_")}, tag=want, suggested="", note=c.get("note", ""), u=stamp)
         print("retag: %d rows whose tool-written tag no longer matches (%s)" % (len(retag), dict(collections.Counter((cur[k]["tag"] + "→" + (v["tag"] or "untagged")) for k, v in retag.items()))))
     receipts = {k: dict(v, u=stamp) for k, v in prop["receipts"].items()}
     budget = {k: dict(v, u=stamp) for k, v in prop["budget"].items()}
