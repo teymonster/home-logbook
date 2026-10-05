@@ -25,7 +25,9 @@ function fakeSheet(name) {
       setValues: (vals) => { vals.forEach((v, i) => { t.rows[row - 1 + i] = v.slice(); }); },
       setDataValidation: () => { t.validations++; },
       setFontWeight: () => {},
+      createFilter: () => { t.filters = (t.filters || 0) + 1; return { setColumnFilterCriteria() { t.filterCriteria = true; return this; } }; },
     }),
+    getFilter: () => (t.filters ? { remove() { t.filters--; } } : null),
     setFrozenRows: (n) => { t.frozen = n; },
     setConditionalFormatRules: () => { t.formatted++; },
     setColumnWidth: () => {},
@@ -39,9 +41,9 @@ const ss = {
   getSheets: () => [],
 };
 const builder = { requireValueInList() { return this; }, setAllowInvalid() { return this; }, setHelpText() { return this; }, build() { return {}; },
-                  whenFormulaSatisfied() { return this; }, setBackground() { return this; }, setRanges() { return this; } };
+                  whenFormulaSatisfied() { return this; }, setBackground() { return this; }, setRanges() { return this; }, setHiddenValues() { return this; } };
 const g = {
-  SpreadsheetApp: { getActiveSpreadsheet: () => ss, newDataValidation: () => builder, newConditionalFormatRule: () => builder },
+  SpreadsheetApp: { getActiveSpreadsheet: () => ss, newDataValidation: () => builder, newConditionalFormatRule: () => builder, newFilterCriteria: () => builder },
   PropertiesService: { getScriptProperties: () => ({ getProperty: (k) => props[k] || null, setProperty: (k, v) => { props[k] = v; } }) },
   LockService: { getScriptLock: () => ({ waitLock() {}, releaseLock() {} }) },
   ContentService: { createTextOutput: (t) => ({ setMimeType: () => ({ text: t }) }), MimeType: { JSON: "json" } },
@@ -199,7 +201,7 @@ test("writeAll orders transactions newest first and formats the tab once", () =>
   });
   const t = tabs.transactions;
   assert.deepStrictEqual(t.rows.slice(1).map((r) => r[0]), ["e-b", "e-c", "e-a"]);
-  assert.deepStrictEqual([t.frozen, t.validations, t.formatted], [1, 1, 1]);
+  assert.deepStrictEqual([t.frozen, t.validations, t.formatted, t.filters, t.filterCriteria], [1, 1, 1, 1, true]);
   const back = readAll("transactions");
   assert.strictEqual(Object.keys(back).length, 3);
   writeAll("transactions", back);

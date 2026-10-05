@@ -89,6 +89,7 @@ function doGet(e) {
       if (p.op === "scan") return out(scanGmail({ months: p.months ? clampInt(p.months, 1, 36, 12) : null, days: SCAN_DAYS, bill: p.bill || null, dry: p.dry === "1",
                                                    after: gmailDate(p.after), before: gmailDate(p.before), max: clampInt(p.max, 10, 300, 60) }));
       if (p.op === "peek") return out(peekMessage(String(p.id || "")));
+      if (p.op === "setup") { setupBudgetTabs(); return out({ ok: true, setup: BUDGET_NAMES }); }
       if (p.op === "budgetscan") return out(scanBudget({ kind: s(p.kind) || "all", dry: p.dry === "1", after: gmailDate(p.after), before: gmailDate(p.before),
                                                          days: p.days ? clampInt(p.days, 1, 400, SCAN_DAYS) : null, max: clampInt(p.max, 10, 300, 300) }));
       return out({ ok: false, error: "unknown op" });
@@ -415,6 +416,17 @@ function setupTransactionsTab(sh) {
                  detail: 360, billId: 90, source: 60, csv: 40, gmailId: 60, updated: 60, deleted: 50 };
   Object.keys(widths).forEach(function (k) { if (col(k) > 0) sh.setColumnWidth(col(k), widths[k]); });
   sh.getRange(1, 1, 1, h.length).setFontWeight("bold");
+  hideSkipRows(sh);
+}
+
+// The sheet's filter hides rows tagged "skip" (transfers, superseded alerts). writeAll only clears
+// and rewrites cell contents, so the filter and its criteria persist across pushes.
+function hideSkipRows(sh) {
+  var h = COLLECTIONS.transactions.header, tagCol = h.indexOf("tag") + 1;
+  var filter = sh.getFilter();
+  if (filter) filter.remove();
+  filter = sh.getRange(1, 1, 6000, h.length).createFilter();
+  filter.setColumnFilterCriteria(tagCol, SpreadsheetApp.newFilterCriteria().setHiddenValues(["skip"]).build());
 }
 
 /* ------------------------------------------------------------------ budget: receipts */
