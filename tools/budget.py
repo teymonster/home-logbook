@@ -978,6 +978,32 @@ def cmd_accept_suggestions(args):
     cmd_pull(args)
 
 
+def cmd_tag(args):
+    """Fill the tag on every untagged row in the given categories (filled tags are the Sheet's and stay)."""
+    guard_repo()
+    if args.tag not in TAGS:
+        die("tag must be one of " + ", ".join(TAGS))
+    cats = {c.strip().lower() for c in args.category.split(",") if c.strip()}
+    sheet = cmd_pull(args)
+    tx = live(sheet["transactions"])
+    stamp = now_iso()
+    rows, kept = {}, collections.Counter()
+    for k, t in tx.items():
+        if (t.get("category") or "") not in cats:
+            continue
+        if t.get("tag"):
+            kept[t["tag"]] += 1
+            continue
+        rows[k] = dict(t, tag=args.tag, suggested="", u=stamp)
+    print("tag %s on %s: %d rows to fill, already tagged and left alone: %s%s" % (args.tag, ",".join(sorted(cats)), len(rows), dict(kept) or "none", " (DRY)" if args.dry else ""))
+    if args.dry or not rows:
+        return
+    ids = list(rows)
+    for i in range(0, len(ids), BATCH):
+        sheet_post({"transactions": {k: rows[k] for k in ids[i:i + BATCH]}})
+    cmd_pull(args)
+
+
 def cmd_pull(_args):
     guard_repo()
     j = sheet_get()
@@ -1224,11 +1250,12 @@ def main(argv=None):
     rp = sub.add_parser("report"); rp.add_argument("--months", type=int, default=12)
     rs = sub.add_parser("rescan-receipts"); rs.add_argument("--dry", action="store_true")
     ac = sub.add_parser("accept-suggestions"); ac.add_argument("--dry", action="store_true")
+    tg = sub.add_parser("tag"); tg.add_argument("--category", required=True); tg.add_argument("--tag", required=True); tg.add_argument("--dry", action="store_true")
     rn = sub.add_parser("run"); rn.add_argument("--months", type=int, default=12); rn.add_argument("--dry", action="store_true")
     args = ap.parse_args(argv)
     guard_repo()
     {"pull": cmd_pull, "backfill": cmd_backfill, "ingest": cmd_ingest, "match": cmd_match, "push": cmd_push, "report": cmd_report, "run": cmd_run,
-     "rescan-receipts": cmd_rescan_receipts, "accept-suggestions": cmd_accept_suggestions}[args.cmd](args)
+     "rescan-receipts": cmd_rescan_receipts, "accept-suggestions": cmd_accept_suggestions, "tag": cmd_tag}[args.cmd](args)
 
 
 if __name__ == "__main__":
