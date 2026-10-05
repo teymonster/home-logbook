@@ -21,3 +21,6 @@ src/
 .env
 node_modules/
 __pycache__/
+
+# Budget data: statements, caches, rules, reports — personal, never ship
+budget/
