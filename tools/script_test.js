@@ -131,6 +131,23 @@ test("fileAttachments saves PDFs into a folder path, skips duplicates, dry run w
   assert.strictEqual(fileAttachments("m2", "299 Bloom/2025", {}).note, "no matching attachments");
 });
 
+// ---- bills ----------------------------------------------------------------------------------
+test("bills: account number round-trips, and an older 19-column tab gets the new header cell", () => {
+  reset();
+  const old = COLLECTIONS.bills.header.slice(0, 19);
+  tabs.bills = { rows: [old, ["comed", "ComEd", "utility", "monthly", "20", "", "143", "TRUE", "", "", "", "", "", "", "", "", "", "2026-10-01T00:00:00.000Z", ""]], formatted: 0, frozen: 0, validations: 0 };
+  const before = readAll("bills");
+  assert.strictEqual(before.comed.account, "", "an old row reads as no account");
+  assert.deepStrictEqual([tabs.bills.rows[0].length, tabs.bills.rows[0][19]], [20, "account"], "header self-heals");
+  assert.strictEqual(normalizeBill({ name: "ComEd", cadence: "monthly", account: "0000-1234-5678" }).account, "0000-1234-5678");
+  assert.strictEqual(normalizeBill({ name: "ComEd", cadence: "monthly" }).account, "");
+  const merged = merge("bills", before, { comed: Object.assign({}, before.comed, { account: "0000-1234-5678", u: "2026-10-02T00:00:00.000Z" }) });
+  writeAll("bills", merged);
+  assert.strictEqual(readAll("bills").comed.account, "0000-1234-5678");
+  assert.strictEqual(billToRow("x", { del: true, u: "z" }).length, COLLECTIONS.bills.header.length);
+  assert.strictEqual(billToRow("x", merged.comed).length, COLLECTIONS.bills.header.length);
+});
+
 // ---- parsers --------------------------------------------------------------------------------
 test("parseChaseAlert reads amount and merchant", () => {
   assert.deepStrictEqual(parseChaseAlert("You made a $226.02 transaction with DD *DOORDASH TARGET"), { amount: 226.02, merchant: "DD *DOORDASH TARGET" });
