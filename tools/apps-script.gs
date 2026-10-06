@@ -5,7 +5,9 @@
  *   log          id | last | history | updated | deleted                    (task tick-offs)
  *   bills        id | name | category | cadence | dueDay | dueMonths | amount | autopay | sender |
  *                subjectPaid | subjectBill | amountRegex | payUrl | notes | active |
- *                lastBillAmount | lastBillDue | updated | deleted
+ *                lastBillAmount | lastBillDue | updated | deleted | account
+ *                (account = the provider's account number, shown on the app's Utilities tab; it was
+ *                added after deleted so existing rows keep their layout, and sheet() fills in the header)
  *   payments     id | billId | date | amount | source | gmailId | subject | updated | deleted
  *   transactions id | date | merchant | amount | account | category | suggested | tag | note | detail |
  *                billId | source | csv | gmailId | updated | deleted     (budget: every charge)
@@ -45,7 +47,7 @@ var COLLECTIONS = {
   bills: {
     header: ["id", "name", "category", "cadence", "dueDay", "dueMonths", "amount", "autopay", "sender",
              "subjectPaid", "subjectBill", "amountRegex", "payUrl", "notes", "active",
-             "lastBillAmount", "lastBillDue", "updated", "deleted"],
+             "lastBillAmount", "lastBillDue", "updated", "deleted", "account"],
     fromRow: billFromRow, toRow: billToRow, normalize: normalizeBill
   },
   payments: {
@@ -183,7 +185,15 @@ function sheet(name) {
   var ss = SpreadsheetApp.getActiveSpreadsheet();
   var sh = ss.getSheetByName(name), created = false;
   if (!sh) { sh = ss.insertSheet(name); created = true; }
-  if (sh.getLastRow() === 0) sh.appendRow(COLLECTIONS[name].header);
+  var header = COLLECTIONS[name].header;
+  if (sh.getLastRow() === 0) sh.appendRow(header);
+  else {
+    // A column appended to the collection (e.g. bills.account) is missing from an older tab's header
+    // row: write the full header so the Sheet labels it. Rows are read by position, so nothing shifts.
+    var h = sh.getRange(1, 1, 1, header.length).getValues()[0] || [];
+    var lastCell = h[header.length - 1];
+    if (lastCell == null || String(lastCell) === "") sh.getRange(1, 1, 1, header.length).setValues([header]);
+  }
   if (created && COLLECTIONS[name].setup) COLLECTIONS[name].setup(sh);
   return sh;
 }
@@ -295,16 +305,16 @@ function billFromRow(r, ctx) {
     sender: s(r[8]), subjectPaid: s(r[9]), subjectBill: s(r[10]), amountRegex: s(r[11]),
     payUrl: s(r[12]), notes: s(r[13]), active: s(r[14]).toUpperCase() !== "FALSE",
     lastBillAmount: toNum(r[15]), lastBillDue: isDate(dateStr(r[16])) ? dateStr(r[16]) : "",
-    u: updated
+    u: updated, account: s(r[19])
   }];
 }
 
 function billToRow(id, v) {
-  if (v.del) return [id, "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", v.u || "", "TRUE"];
+  if (v.del) return [id, "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", v.u || "", "TRUE", ""];
   return [id, v.name || "", v.category || "", v.cadence || "monthly", String(v.dueDay || 1),
     (v.dueMonths || []).join(","), numStr(v.amount), v.autopay ? "TRUE" : "", v.sender || "",
     v.subjectPaid || "", v.subjectBill || "", v.amountRegex || "", v.payUrl || "", v.notes || "",
-    v.active === false ? "FALSE" : "", numStr(v.lastBillAmount), v.lastBillDue || "", v.u || "", ""];
+    v.active === false ? "FALSE" : "", numStr(v.lastBillAmount), v.lastBillDue || "", v.u || "", "", v.account || ""];
 }
 
 function normalizeBill(v) {
@@ -323,7 +333,7 @@ function normalizeBill(v) {
     sender: s(v.sender), subjectPaid: s(v.subjectPaid), subjectBill: s(v.subjectBill), amountRegex: s(v.amountRegex),
     payUrl: s(v.payUrl), notes: s(v.notes), active: v.active !== false && s(v.active).toUpperCase() !== "FALSE",
     lastBillAmount: toNum(v.lastBillAmount), lastBillDue: isDate(s(v.lastBillDue)) ? s(v.lastBillDue) : "",
-    u: isoOf(v.u) || now
+    u: isoOf(v.u) || now, account: s(v.account)
   };
 }
 

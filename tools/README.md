@@ -58,6 +58,9 @@ at 60 messages per bill per run (`max=` up to 300 for admin backfills).
 
 Bill rows can also be written with the app token: `POST {token, bills:{id:{...,u}}}`.
 
+A bill's `account` column (the provider's account number) is what the app's Utilities tab shows; it
+lives only in the Sheet, never in the page source. Edit it in the Sheet or under Bills › Edit in the app.
+
 ## Budget (tools/budget.py)
 
 Three more tabs, `transactions`, `receipts` and `budget`, hold every charge, the parsed receipt
