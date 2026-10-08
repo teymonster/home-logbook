@@ -47,7 +47,20 @@ curl -sL "$url?admin=$admin&op=search&max=100&q=$(python3 -c 'import urllib.pars
 curl -sL "$url?admin=$admin&op=raw&id=<gmailId>"                                           # MIME skeleton + decode diagnostics
 curl -sL "$url?admin=$admin&op=file&id=<gmailId>&dry=1"                                    # list a message's PDF attachments
 curl -sL "$url?admin=$admin&op=file&id=<gmailId>&folder=299%20Bloom/2025"                  # save them into that Drive folder (skips names already there; &overwrite=1 replaces; &all=1 for non-PDFs)
+curl -sL "$url?admin=$admin&op=drivels&folder=<folder>/2026"                                # files + subfolders in a Drive folder, with ids and links (nothing is created)
+curl -sL "$url?admin=$admin&op=drivefind&name=Quick%20Kill"                               # files anywhere in Drive whose name contains the text
+curl -sL "$url?admin=$admin&op=sheetinfo&id=<spreadsheetId>"                              # another spreadsheet's tabs with their gids
+curl -sL "$url?admin=$admin&op=sheetget&id=<spreadsheetId>&gid=<gid>"                     # one tab's cells as displayed (&tab=<name> also works; &max=500 rows)
+python3 tools/sheetops.py sheetput <spreadsheetId> --gid <gid> rows.json                  # append rows (POST {admin, op:"sheetput", id, gid, values}); --range B5 anchors instead
 ```
+
+`sheetput` cells are plain values, or `{"d":"2026-02-03"}` for a real date cell, or
+`{"rt":[{"t":"invoice.pdf","u":"https://…"},{"t":" · "},…]}` for several links in one cell. A string
+starting with `=` is written as a formula. `tools/sheetops.py` wraps all five ops and reads `.sync.json`.
+The `sheet*` ops need the full `https://www.googleapis.com/auth/spreadsheets` scope in `appsscript.json`
+(`spreadsheets.currentonly` only reaches the bound Sheet); changing a scope means re-consenting
+(run any function from the editor, or revoke the script at myaccount.google.com/connections first if
+the prompt does not appear) and deploying a new version.
 
 `op=file` needs the `https://www.googleapis.com/auth/drive` scope in `appsscript.json` (the folder
 lookup by name has to see existing folders, which the narrower `drive.file` scope cannot).
