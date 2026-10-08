@@ -84,9 +84,54 @@ function fakeFolder(f) {
     createFolder: (n) => { const nf = { name: n, folders: [], files: [] }; f.folders.push(nf); return fakeFolder(nf); },
     getFilesByName: (n) => iter(f.files.filter((x) => x.name === n && !x.trashed).map((x) => ({ getUrl: () => "url:" + x.name, setTrashed: (t) => { x.trashed = t; } }))),
     createFile: (blob) => { const rec = { name: blob.name, bytes: blob.bytes, mimeType: blob.mimeType }; f.files.push(rec); return { getUrl: () => "url:" + rec.name }; },
+    getId: () => "id:" + f.name, getName: () => f.name, getUrl: () => "url:" + f.name,
+    getFolders: () => iter(f.folders.map(fakeFolder)),
+    getFiles: () => iter(f.files.filter((x) => !x.trashed).map((x) => fakeFile(x, f))),
   };
 }
 g.Utilities.newBlob = (bytes, mimeType, name) => ({ getDataAsString: () => Buffer.from(bytes).toString("utf8"), bytes, mimeType, name });
+
+// Other spreadsheets (admin ops sheetinfo/sheetget/sheetput): id -> { name, tabs: [{ name, gid, rows, rich }] }
+let otherBooks = {};
+function fakeOtherSheet(t) {
+  function slice(row, col, nrows, ncols) {
+    const out = [];
+    for (let i = 0; i < nrows; i++) { const r = t.rows[row - 1 + i] || []; out.push(Array.from({ length: ncols }, (_, j) => (r[col - 1 + j] == null ? "" : r[col - 1 + j]))); }
+    return out;
+  }
+  function rangeObj(row, col, nrows, ncols) {
+    return {
+      getRow: () => row, getColumn: () => col,
+      getDisplayValues: () => slice(row, col, nrows, ncols).map((r) => r.map((v) => (v instanceof Date ? v.toISOString().slice(0, 10) : String(v)))),
+      getFormulas: () => slice(row, col, nrows, ncols).map((r) => r.map((v) => (typeof v === "string" && v[0] === "=" ? v : ""))),
+      setValues: (vals) => { vals.forEach((v, i) => { const r = t.rows[row - 1 + i] || (t.rows[row - 1 + i] = []); v.forEach((x, j) => { r[col - 1 + j] = x; }); }); },
+      setRichTextValue: (rt) => { t.rich[row + ":" + col] = rt; },
+    };
+  }
+  return {
+    getName: () => t.name, getSheetId: () => t.gid,
+    getLastRow: () => t.rows.length, getLastColumn: () => Math.max(0, ...t.rows.map((r) => r.length)),
+    getRange: (a, b, c, d) => {
+      if (typeof a === "string") { const m = /^([A-Z]+)(\d+)$/.exec(a); return rangeObj(Number(m[2]), m[1].charCodeAt(0) - 64, 1, 1); }
+      return rangeObj(a, b, c || 1, d || 1);
+    },
+  };
+}
+g.SpreadsheetApp.openById = (id) => {
+  const b = otherBooks[id]; if (!b) throw new Error("not found: " + id);
+  return { getName: () => b.name, getUrl: () => "url:" + id, getSheets: () => b.tabs.map(fakeOtherSheet),
+           getSheetByName: (n) => { const t = b.tabs.find((x) => x.name === n); return t ? fakeOtherSheet(t) : null; } };
+};
+g.SpreadsheetApp.newRichTextValue = () => { const rt = { text: "", links: [] }; const b = { setText(x) { rt.text = x; return b; }, setLinkUrl(s0, e0, u) { rt.links.push([s0, e0, u]); return b; }, build: () => rt }; return b; };
+function fakeFile(x, parent) {
+  return { getName: () => x.name, getId: () => "id:" + x.name, getUrl: () => "url:" + x.name, getMimeType: () => x.mimeType || "", getSize: () => (x.bytes || []).length,
+           getDateCreated: () => new Date(Date.UTC(2026, 0, 1)), getParents: () => iter([fakeFolder(parent)]) };
+}
+g.DriveApp.searchFiles = (q) => {
+  const needle = /title contains '([^']*)'/.exec(q)[1], hits = [];
+  (function walk(f) { f.files.forEach((x) => { if (!x.trashed && x.name.includes(needle)) hits.push(fakeFile(x, f)); }); f.folders.forEach(walk); })(driveRoot);
+  return iter(hits);
+};
 Object.assign(global, g);
 // Load the script into the global scope (top-level function declarations become globals).
 (0, eval)(src);
@@ -339,6 +384,56 @@ test("scanBudget harvests alerts and receipts, skips what it has seen, writes un
   assert.strictEqual(again.skipped.dup, 2, "c1 + a1 already harvested (c2 is unparsed, so it is re-checked)");
   assert.deepStrictEqual(again.kinds, ["chase", "amazon"]);
   assert.strictEqual(scanBudget({ kind: "lyft" }).ok, false);
+});
+
+
+// ---- drive listing + other spreadsheets (admin) ------------------------------------------------
+test("driveList/driveFind read Drive without creating; sheetInfo/sheetGet/sheetPut read and append to another spreadsheet", () => {
+  reset();
+  driveRoot.folders.push({ name: "House", folders: [{ name: "2026", folders: [], files: [{ name: "invoice_25094.pdf", bytes: [1, 2], mimeType: "application/pdf" }] }], files: [] });
+  assert.strictEqual(driveList("House/2025").ok, false);
+  const ls = driveList("House/2026");
+  assert.deepStrictEqual([ls.ok, ls.folders, ls.files.map((f) => [f.name, f.size, f.created])], [true, [], [["invoice_25094.pdf", 2, "2026-01-01"]]]);
+  assert.strictEqual(driveRoot.folders[0].folders.length, 1, "lookup never creates folders");
+  const found = driveFind("25094", 10);
+  assert.deepStrictEqual([found.files.length, found.files[0].parents, found.files[0].url], [1, ["2026"], "url:invoice_25094.pdf"]);
+  assert.strictEqual(driveFind("", 10).ok, false);
+
+  otherBooks.hc = { name: "house costs", tabs: [
+    { name: "Initial", gid: 1, rows: [["a"]], rich: {} },
+    { name: "New House Purchases", gid: 869386941, rich: {},
+      rows: [["Date", "Cost", "Item", "Whose?", "From", "Notes"], [new Date(2025, 4, 14), 2648, "Moving", "Household", "Golan", "25 - Golan.jpg"]] },
+  ] };
+  const info = sheetInfo("hc");
+  assert.deepStrictEqual(info.tabs.map((t) => [t.name, t.gid, t.rows, t.cols]), [["Initial", 1, 1, 1], ["New House Purchases", 869386941, 2, 6]]);
+  const got = sheetGet("hc", { gid: "869386941" }, 500);
+  assert.deepStrictEqual([got.tab, got.rows, got.truncated, got.values[1][1], got.values[1][0]], ["New House Purchases", 2, false, "2648", "2025-05-14"]);
+  assert.strictEqual(sheetGet("hc", { tab: "Initial" }, 500).gid, 1);
+  assert.throws(() => sheetGet("hc", { gid: 5 }, 10), /no tab with gid/);
+  assert.throws(() => sheetGet("nope", {}, 10), /not found/);
+
+  const put = sheetPut("hc", { gid: 869386941 }, { values: [[{ d: "2026-02-03" }, 1000, "Attic deposit", "Household", "Green Attic",
+    { rt: [{ t: "estimate_90189.pdf", u: "https://x/1" }, { t: " · " }, { t: "receipt.pdf", u: "https://x/2" }] }]] });
+  assert.deepStrictEqual([put.ok, put.top, put.left, put.rows, put.cols, put.richCells], [true, 3, 1, 1, 6, 1]);
+  const tab = otherBooks.hc.tabs[1], row = tab.rows[2];
+  assert.ok(row[0] instanceof Date && row[0].getFullYear() === 2026 && row[0].getMonth() === 1 && row[0].getDate() === 3, "date cell is a real local date");
+  assert.deepStrictEqual(row.slice(1, 6), [1000, "Attic deposit", "Household", "Green Attic", "estimate_90189.pdf · receipt.pdf"]);
+  assert.deepStrictEqual(tab.rich["3:6"].links, [[0, 18, "https://x/1"], [21, 32, "https://x/2"]]);
+
+  sheetPut("hc", { tab: "Initial" }, { values: [["x", "y"]], range: "B5" });
+  assert.deepStrictEqual(otherBooks.hc.tabs[0].rows[4].slice(1, 3), ["x", "y"]);
+  assert.strictEqual(sheetPut("hc", { gid: 1 }, { values: [] }).ok, false);
+  assert.throws(() => sheetPut("hc", { gid: 1 }, { values: [[{ d: "Feb 3" }]] }), /bad date/);
+  assert.throws(() => sheetPut("hc", { gid: 1 }, { values: [[{ nope: 1 }]] }), /unknown cell object/);
+
+  // Dispatch: POST with op needs the admin token and never the app token; a wrong token is refused before any work.
+  const post = (b) => JSON.parse(doPost({ postData: { contents: JSON.stringify(b) } }).text);
+  assert.strictEqual(post({ op: "sheetput", admin: "wrong", id: "hc", gid: 1, values: [["z"]] }).error, "unauthorized");
+  assert.strictEqual(post({ op: "sheetput", admin: props.ADMIN_TOKEN, id: "hc", gid: 1, values: [["z"]] }).ok, true);
+  assert.strictEqual(post({ op: "nothing", admin: props.ADMIN_TOKEN }).error, "unknown op");
+  const get = (q) => JSON.parse(doGet({ parameter: q }).text);
+  assert.strictEqual(get({ admin: props.ADMIN_TOKEN, op: "sheetinfo", id: "hc" }).name, "house costs");
+  assert.strictEqual(get({ admin: props.ADMIN_TOKEN, op: "drivels", folder: "House/2026" }).files.length, 1);
 });
 
 console.log(passed + " passed" + (process.exitCode ? ", with failures" : ""));

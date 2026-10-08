@@ -1,5 +1,5 @@
 /**
- * Home Logbook — Google Apps Script web app (v10).
+ * Home Logbook — Google Apps Script web app (v13).
  *
  * Bound to the "Home Logbook progress" Sheet. Tabs, created on first use:
  *   log          id | last | history | updated | deleted                    (task tick-offs)
@@ -22,8 +22,10 @@
  * Setup (once):
  *   1. Script properties: TOKEN (the app's token) and ADMIN_TOKEN (different; only used from
  *      the owner's machine, never from the page).
- *   2. Project Settings → "Show appsscript.json" → paste tools/appsscript.json (Gmail read-only
- *      scope + the Gmail advanced service).
+ *   2. Project Settings → "Show appsscript.json" → paste tools/appsscript.json (Gmail read-only,
+ *      Drive and Sheets scopes + the Gmail advanced service). The admin ops sheetinfo/sheetget/
+ *      sheetput open Beck's other spreadsheets by id, so the Sheets scope is the full
+ *      https://www.googleapis.com/auth/spreadsheets, not spreadsheets.currentonly.
  *   3. Run installTrigger() from the editor once: approves the scopes and schedules the daily
  *      email scan at 06:00.
  *   4. Deploy → New deployment → Web app → Execute as Me → Anyone. Later changes: Deploy →
@@ -34,7 +36,7 @@
  * typo in the Sheet can never cause rows to be dropped.
  */
 
-var VERSION = 12;
+var VERSION = 13;
 var CADENCES = ["weekly", "monthly", "bimonthly", "quarterly", "semiannual", "annual"];
 var SCAN_DAYS = 40;             // default look-back for the daily / on-demand scan
 var SCAN_MIN_GAP_MS = 5 * 60 * 1000;
@@ -94,6 +96,10 @@ function doGet(e) {
       if (p.op === "file") return out(fileAttachments(String(p.id || ""), String(p.folder || DEFAULT_FILE_FOLDER),
                                                       { dry: p.dry === "1", all: p.all === "1", overwrite: p.overwrite === "1" }));
       if (p.op === "setup") { setupBudgetTabs(); return out({ ok: true, setup: BUDGET_NAMES }); }
+      if (p.op === "drivels") return out(driveList(String(p.folder || "")));
+      if (p.op === "drivefind") return out(driveFind(String(p.name || ""), clampInt(p.max, 1, 200, 50)));
+      if (p.op === "sheetinfo") return out(sheetInfo(String(p.id || "")));
+      if (p.op === "sheetget") return out(sheetGet(String(p.id || ""), { gid: p.gid, tab: p.tab }, clampInt(p.max, 1, 2000, 500)));
       if (p.op === "budgetscan") return out(scanBudget({ kind: s(p.kind) || "all", dry: p.dry === "1", after: gmailDate(p.after), before: gmailDate(p.before),
                                                          days: p.days ? clampInt(p.days, 1, 400, SCAN_DAYS) : null, max: clampInt(p.max, 10, 300, 300) }));
       return out({ ok: false, error: "unknown op" });
@@ -114,6 +120,16 @@ function doGet(e) {
 function doPost(e) {
   var body;
   try { body = JSON.parse(e.postData.contents); } catch (err) { return out({ ok: false, error: "bad json" }); }
+  if (body.op !== undefined) {
+    // Owner-only POST operations (writes to another spreadsheet). Never consult the app token here.
+    if (!adminAuthorized(body.admin)) return out({ ok: false, error: "unauthorized" });
+    try {
+      if (body.op === "sheetput") return out(sheetPut(String(body.id || ""), { gid: body.gid, tab: body.tab }, body));
+      return out({ ok: false, error: "unknown op" });
+    } catch (err) {
+      return out({ ok: false, error: String(err) });
+    }
+  }
   if (!authorized(body.token)) return out({ ok: false, error: "unauthorized" });
   // Owner-only: body.force with the admin token lets a push replace Sheet-owned columns (tag, note,
   // category, target) for the rows it sends. The page never has the admin token.
@@ -837,6 +853,141 @@ function driveFolderByPath(path, created) {
     else { folder = folder.createFolder(name); if (created) created.push(sofar.join("/")); }
   });
   return folder;
+}
+
+/* ------------------------------------------------------------------ drive + other spreadsheets (admin) */
+
+// op=drivels&folder=<folder>/2026 — what is in a Drive folder (by path from My Drive; nothing is created).
+function driveList(path) {
+  var folder = driveFolderLookup(path);
+  if (!folder) return { ok: false, error: "no such folder: " + path };
+  var res = { ok: true, path: path, id: folder.getId(), url: folder.getUrl(), folders: [], files: [] };
+  var fs = folder.getFolders();
+  while (fs.hasNext()) { var f = fs.next(); res.folders.push({ name: f.getName(), id: f.getId(), url: f.getUrl() }); }
+  var it = folder.getFiles();
+  while (it.hasNext()) res.files.push(fileRecord(it.next()));
+  res.files.sort(function (a, b) { return a.name < b.name ? -1 : a.name > b.name ? 1 : 0; });
+  return res;
+}
+
+// op=drivefind&name=Quick Kill — files anywhere in Drive whose name contains the text (trash excluded).
+function driveFind(name, max) {
+  if (!name) return { ok: false, error: "name required" };
+  var q = "title contains '" + name.replace(/\\/g, "\\\\").replace(/'/g, "\\'") + "' and trashed = false";
+  var it = DriveApp.searchFiles(q), files = [];
+  while (it.hasNext() && files.length < max) {
+    var f = it.next(), rec = fileRecord(f), parents = f.getParents(), path = [];
+    while (parents.hasNext()) path.push(parents.next().getName());
+    rec.parents = path;
+    files.push(rec);
+  }
+  return { ok: true, name: name, files: files };
+}
+
+function fileRecord(f) {
+  return { name: f.getName(), id: f.getId(), url: f.getUrl(), mimeType: f.getMimeType(), size: f.getSize(),
+           created: Utilities.formatDate(f.getDateCreated(), "UTC", "yyyy-MM-dd") };
+}
+
+// Like driveFolderByPath but never creates: null when any segment is missing.
+function driveFolderLookup(path) {
+  var folder = DriveApp.getRootFolder();
+  var parts = String(path || "").split("/").map(function (x) { return x.trim(); }).filter(Boolean);
+  for (var i = 0; i < parts.length; i++) {
+    var it = folder.getFoldersByName(parts[i]);
+    if (!it.hasNext()) return null;
+    folder = it.next();
+  }
+  return folder;
+}
+
+// op=sheetinfo&id=<spreadsheetId> — tabs with their gids. Needs the full spreadsheets scope (not currentonly).
+function sheetInfo(id) {
+  if (!id) return { ok: false, error: "id required" };
+  var ss = SpreadsheetApp.openById(id);
+  return { ok: true, id: id, name: ss.getName(), url: ss.getUrl(), tabs: ss.getSheets().map(function (sh) {
+    return { name: sh.getName(), gid: sh.getSheetId(), rows: sh.getLastRow(), cols: sh.getLastColumn() };
+  }) };
+}
+
+// A tab of another spreadsheet, by gid (the number after #gid= in its URL) or by name.
+function otherTab(id, which) {
+  if (!id) throw new Error("id required");
+  var ss = SpreadsheetApp.openById(id), sheets = ss.getSheets(), sh = null;
+  if (which.gid !== undefined && which.gid !== null && String(which.gid) !== "") {
+    var gid = Number(which.gid);
+    for (var i = 0; i < sheets.length; i++) if (sheets[i].getSheetId() === gid) sh = sheets[i];
+    if (!sh) throw new Error("no tab with gid " + which.gid);
+  } else if (which.tab) {
+    sh = ss.getSheetByName(String(which.tab));
+    if (!sh) throw new Error("no tab named " + which.tab);
+  } else sh = sheets[0];
+  return { ss: ss, sh: sh };
+}
+
+// op=sheetget&id=&gid=|tab=[&max=500] — the tab's cells as shown, plus any formulas, for up to max rows.
+function sheetGet(id, which, max) {
+  var t = otherTab(id, which), sh = t.sh;
+  var rows = sh.getLastRow(), cols = sh.getLastColumn();
+  var n = Math.min(rows, max || 500);
+  var values = n && cols ? sh.getRange(1, 1, n, cols).getDisplayValues() : [];
+  var formulas = n && cols ? sh.getRange(1, 1, n, cols).getFormulas() : [];
+  var links = [];
+  for (var r = 0; r < formulas.length; r++) for (var c = 0; c < formulas[r].length; c++) {
+    if (formulas[r][c]) links.push({ row: r + 1, col: c + 1, formula: formulas[r][c] });
+  }
+  return { ok: true, id: id, name: t.ss.getName(), tab: sh.getName(), gid: sh.getSheetId(), rows: rows, cols: cols,
+           truncated: rows > n, values: values, formulas: links };
+}
+
+// POST {admin, op:"sheetput", id, gid|tab, values:[[...]], range?:"A12", col?:1}
+// Appends the rows after the tab's last used row (or writes them at `range`, whose top-left cell
+// anchors the block). Each cell is a number/string/boolean, or one of:
+//   {d:"YYYY-MM-DD"}                       a real date cell (local midnight in the Sheet's time zone)
+//   {rt:[{t:"text", u:"https://…"}, …]}   rich text: several link runs in one cell
+// A string starting with "=" is written as a formula, as the Sheets UI would.
+function sheetPut(id, which, body) {
+  var values = body && body.values;
+  if (!Array.isArray(values) || !values.length || !values.every(Array.isArray)) return { ok: false, error: "values must be a non-empty array of rows" };
+  var ncols = Math.max.apply(null, values.map(function (r) { return r.length; }));
+  var t = otherTab(id, which), sh = t.sh;
+  var top, left;
+  if (body.range) {
+    var anchor = sh.getRange(String(body.range));
+    top = anchor.getRow(); left = anchor.getColumn();
+  } else {
+    top = sh.getLastRow() + 1; left = Number(body.col) >= 1 ? Number(body.col) : 1;
+  }
+  var plain = [], rich = [];
+  values.forEach(function (row, r) {
+    var out = [];
+    for (var c = 0; c < ncols; c++) {
+      var v = c < row.length ? row[c] : "";
+      if (v && typeof v === "object" && v.d) {
+        var m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(v.d));
+        if (!m) throw new Error("bad date " + v.d + " (want YYYY-MM-DD)");
+        out.push(new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3])));
+      } else if (v && typeof v === "object" && Array.isArray(v.rt)) {
+        out.push(v.rt.map(function (run) { return s(run.t); }).join(""));
+        rich.push({ r: r, c: c, runs: v.rt });
+      } else if (v && typeof v === "object") {
+        throw new Error("unknown cell object at row " + (r + 1) + " col " + (c + 1));
+      } else out.push(v == null ? "" : v);
+    }
+    plain.push(out);
+  });
+  sh.getRange(top, left, plain.length, ncols).setValues(plain);
+  rich.forEach(function (x) {
+    var text = x.runs.map(function (run) { return s(run.t); }).join("");
+    var b = SpreadsheetApp.newRichTextValue().setText(text), pos = 0;
+    x.runs.forEach(function (run) {
+      var len = s(run.t).length;
+      if (run.u && len) b.setLinkUrl(pos, pos + len, String(run.u));
+      pos += len;
+    });
+    sh.getRange(top + x.r, left + x.c).setRichTextValue(b.build());
+  });
+  return { ok: true, id: id, tab: sh.getName(), gid: sh.getSheetId(), top: top, left: left, rows: plain.length, cols: ncols, richCells: rich.length };
 }
 
 /* ------------------------------------------------------------------ gmail: scan */
