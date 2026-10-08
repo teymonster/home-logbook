@@ -53,6 +53,8 @@ const g = {
     newBlob: (bytes) => ({ getDataAsString: () => Buffer.from(bytes).toString("utf8") }),
     base64DecodeWebSafe: (s) => Array.from(Buffer.from(s, "base64url")),
     base64Decode: (s) => Array.from(Buffer.from(s, "base64")),
+    // Only the yyyy-MM-dd form is used; the stub records the zone it was asked for on the Date.
+    parseDate: (str, tz) => { const [y, m, d] = str.split("-").map(Number); const dt = new Date(y, m - 1, d); dt.tz = tz; return dt; },
   },
   ScriptApp: { getProjectTriggers: () => [], newTrigger: () => ({ timeBased: () => ({ everyDays: () => ({ atHour: () => ({ create() {} }) }) }) }) },
   Logger: { log() {} },
@@ -119,7 +121,7 @@ function fakeOtherSheet(t) {
 }
 g.SpreadsheetApp.openById = (id) => {
   const b = otherBooks[id]; if (!b) throw new Error("not found: " + id);
-  return { getName: () => b.name, getUrl: () => "url:" + id, getSheets: () => b.tabs.map(fakeOtherSheet),
+  return { getName: () => b.name, getUrl: () => "url:" + id, getSpreadsheetTimeZone: () => b.tz || "America/Chicago", getSheets: () => b.tabs.map(fakeOtherSheet),
            getSheetByName: (n) => { const t = b.tabs.find((x) => x.name === n); return t ? fakeOtherSheet(t) : null; } };
 };
 g.SpreadsheetApp.newRichTextValue = () => { const rt = { text: "", links: [] }; const b = { setText(x) { rt.text = x; return b; }, setLinkUrl(s0, e0, u) { rt.links.push([s0, e0, u]); return b; }, build: () => rt }; return b; };
@@ -416,7 +418,9 @@ test("driveList/driveFind read Drive without creating; sheetInfo/sheetGet/sheetP
     { rt: [{ t: "estimate_90189.pdf", u: "https://x/1" }, { t: " · " }, { t: "receipt.pdf", u: "https://x/2" }] }]] });
   assert.deepStrictEqual([put.ok, put.top, put.left, put.rows, put.cols, put.richCells], [true, 3, 1, 1, 6, 1]);
   const tab = otherBooks.hc.tabs[1], row = tab.rows[2];
-  assert.ok(row[0] instanceof Date && row[0].getFullYear() === 2026 && row[0].getMonth() === 1 && row[0].getDate() === 3, "date cell is a real local date");
+  assert.ok(row[0] instanceof Date && row[0].getFullYear() === 2026 && row[0].getMonth() === 1 && row[0].getDate() === 3, "date cell is a real date");
+  assert.strictEqual(row[0].tz, "America/Chicago", "built in the target spreadsheet's zone, not the script's");
+  assert.strictEqual(sheetInfo("hc").tz, "America/Chicago");
   assert.deepStrictEqual(row.slice(1, 6), [1000, "Attic deposit", "Household", "Green Attic", "estimate_90189.pdf · receipt.pdf"]);
   assert.deepStrictEqual(tab.rich["3:6"].links, [[0, 18, "https://x/1"], [21, 32, "https://x/2"]]);
 

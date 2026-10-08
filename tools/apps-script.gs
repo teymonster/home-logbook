@@ -36,7 +36,7 @@
  * typo in the Sheet can never cause rows to be dropped.
  */
 
-var VERSION = 13;
+var VERSION = 14;
 var CADENCES = ["weekly", "monthly", "bimonthly", "quarterly", "semiannual", "annual"];
 var SCAN_DAYS = 40;             // default look-back for the daily / on-demand scan
 var SCAN_MIN_GAP_MS = 5 * 60 * 1000;
@@ -905,7 +905,7 @@ function driveFolderLookup(path) {
 function sheetInfo(id) {
   if (!id) return { ok: false, error: "id required" };
   var ss = SpreadsheetApp.openById(id);
-  return { ok: true, id: id, name: ss.getName(), url: ss.getUrl(), tabs: ss.getSheets().map(function (sh) {
+  return { ok: true, id: id, name: ss.getName(), url: ss.getUrl(), tz: ss.getSpreadsheetTimeZone(), tabs: ss.getSheets().map(function (sh) {
     return { name: sh.getName(), gid: sh.getSheetId(), rows: sh.getLastRow(), cols: sh.getLastColumn() };
   }) };
 }
@@ -943,7 +943,7 @@ function sheetGet(id, which, max) {
 // POST {admin, op:"sheetput", id, gid|tab, values:[[...]], range?:"A12", col?:1}
 // Appends the rows after the tab's last used row (or writes them at `range`, whose top-left cell
 // anchors the block). Each cell is a number/string/boolean, or one of:
-//   {d:"YYYY-MM-DD"}                       a real date cell (local midnight in the Sheet's time zone)
+//   {d:"YYYY-MM-DD"}                       a real date cell (midnight in that spreadsheet's time zone)
 //   {rt:[{t:"text", u:"https://…"}, …]}   rich text: several link runs in one cell
 // A string starting with "=" is written as a formula, as the Sheets UI would.
 function runText(run) { return run && run.t != null ? String(run.t) : ""; } // not trimmed: separators like " · " keep their spaces so link offsets stay right
@@ -952,7 +952,7 @@ function sheetPut(id, which, body) {
   var values = body && body.values;
   if (!Array.isArray(values) || !values.length || !values.every(Array.isArray)) return { ok: false, error: "values must be a non-empty array of rows" };
   var ncols = Math.max.apply(null, values.map(function (r) { return r.length; }));
-  var t = otherTab(id, which), sh = t.sh;
+  var t = otherTab(id, which), sh = t.sh, tz = t.ss.getSpreadsheetTimeZone();
   var top, left;
   if (body.range) {
     var anchor = sh.getRange(String(body.range));
@@ -968,7 +968,9 @@ function sheetPut(id, which, body) {
       if (v && typeof v === "object" && v.d) {
         var m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(v.d));
         if (!m) throw new Error("bad date " + v.d + " (want YYYY-MM-DD)");
-        out.push(new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3])));
+        // Midnight in the target spreadsheet's own time zone: a Date built in the script's zone shows
+        // as the previous day when the two zones differ (seen 2026-10-08: six summer dates landed a day early).
+        out.push(Utilities.parseDate(m[1] + "-" + m[2] + "-" + m[3], tz, "yyyy-MM-dd"));
       } else if (v && typeof v === "object" && Array.isArray(v.rt)) {
         out.push(v.rt.map(function (run) { return runText(run); }).join(""));
         rich.push({ r: r, c: c, runs: v.rt });
