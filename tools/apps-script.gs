@@ -946,6 +946,8 @@ function sheetGet(id, which, max) {
 //   {d:"YYYY-MM-DD"}                       a real date cell (local midnight in the Sheet's time zone)
 //   {rt:[{t:"text", u:"https://…"}, …]}   rich text: several link runs in one cell
 // A string starting with "=" is written as a formula, as the Sheets UI would.
+function runText(run) { return run && run.t != null ? String(run.t) : ""; } // not trimmed: separators like " · " keep their spaces so link offsets stay right
+
 function sheetPut(id, which, body) {
   var values = body && body.values;
   if (!Array.isArray(values) || !values.length || !values.every(Array.isArray)) return { ok: false, error: "values must be a non-empty array of rows" };
@@ -968,7 +970,7 @@ function sheetPut(id, which, body) {
         if (!m) throw new Error("bad date " + v.d + " (want YYYY-MM-DD)");
         out.push(new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3])));
       } else if (v && typeof v === "object" && Array.isArray(v.rt)) {
-        out.push(v.rt.map(function (run) { return s(run.t); }).join(""));
+        out.push(v.rt.map(function (run) { return runText(run); }).join(""));
         rich.push({ r: r, c: c, runs: v.rt });
       } else if (v && typeof v === "object") {
         throw new Error("unknown cell object at row " + (r + 1) + " col " + (c + 1));
@@ -978,10 +980,10 @@ function sheetPut(id, which, body) {
   });
   sh.getRange(top, left, plain.length, ncols).setValues(plain);
   rich.forEach(function (x) {
-    var text = x.runs.map(function (run) { return s(run.t); }).join("");
+    var text = x.runs.map(function (run) { return runText(run); }).join("");
     var b = SpreadsheetApp.newRichTextValue().setText(text), pos = 0;
     x.runs.forEach(function (run) {
-      var len = s(run.t).length;
+      var len = runText(run).length;
       if (run.u && len) b.setLinkUrl(pos, pos + len, String(run.u));
       pos += len;
     });
