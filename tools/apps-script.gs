@@ -109,7 +109,7 @@ function doGet(e) {
       if (p.op === "scan") return out(scanGmail({ months: p.months ? clampInt(p.months, 1, 36, 12) : null, days: SCAN_DAYS, bill: p.bill || null, dry: p.dry === "1",
                                                    after: gmailDate(p.after), before: gmailDate(p.before), max: clampInt(p.max, 10, 300, 60) }));
       if (p.op === "peek") return out(peekMessage(String(p.id || "")));
-      if (p.op === "file") return out(fileAttachments(String(p.id || ""), String(p.folder || DEFAULT_FILE_FOLDER),
+      if (p.op === "file") return out(fileAttachments(String(p.id || ""), String(p.folder || defaultFileFolder()),
                                                       { dry: p.dry === "1", all: p.all === "1", overwrite: p.overwrite === "1" }));
       if (p.op === "setup") { setupBudgetTabs(); return out({ ok: true, setup: BUDGET_NAMES }); }
       if (p.op === "drivels") return out(driveList(String(p.folder || "")));
@@ -819,11 +819,16 @@ function peekMessage(id) {
 
 /* ------------------------------------------------------------------ gmail → drive: file attachments (admin) */
 
-// op=file&id=<gmailId>[&folder=House/2025][&dry=1][&all=1][&overwrite=1]
+// op=file&id=<gmailId>[&folder=<path from My Drive>][&dry=1][&all=1][&overwrite=1]
 // Saves a message's attachments (PDFs unless all=1) into the Drive folder named by path from My Drive.
 // Missing folders along the path are created. A file whose name already exists in the folder is
 // skipped unless overwrite=1 (which trashes the old copy first). Needs the Drive scope in appsscript.json.
-var DEFAULT_FILE_FOLDER = "House/2025";
+// Default: this year's folder under BINDER_ROOT (a script property, so the folder name never lives in the repo).
+function defaultFileFolder() {
+  var root = getProp("BINDER_ROOT");
+  if (!root) throw new Error("folder required (BINDER_ROOT not set)");
+  return root + "/" + Utilities.formatDate(new Date(), tz(), "yyyy");
+}
 
 function fileAttachments(id, folderPath, opts) {
   opts = opts || {};
