@@ -1,5 +1,5 @@
 /**
- * Home Logbook — Google Apps Script web app (v16).
+ * Home Logbook — Google Apps Script web app (v17).
  *
  * Bound to the "Home Logbook progress" Sheet. Tabs, created on first use:
  *   log          id | last | history | updated | deleted                    (task tick-offs)
@@ -46,7 +46,7 @@
  * typo in the Sheet can never cause rows to be dropped.
  */
 
-var VERSION = 16;
+var VERSION = 17;
 var CADENCES = ["weekly", "monthly", "bimonthly", "quarterly", "semiannual", "annual"];
 var SCAN_DAYS = 40;             // default look-back for the daily / on-demand scan
 var SCAN_MIN_GAP_MS = 5 * 60 * 1000;
@@ -145,6 +145,11 @@ function doGet(e) {
 function doPost(e) {
   var body;
   try { body = JSON.parse(e.postData.contents); } catch (err) { return out({ ok: false, error: "bad json" }); }
+  if (body.op === "readlabel") {
+    // Page op: read photos of a tag, box or receipt with Claude and return the item fields it finds.
+    if (!authorized(body.token)) return out({ ok: false, error: "unauthorized" });
+    try { return out(readLabel(body)); } catch (err) { return out({ ok: false, error: String(err) }); }
+  }
   if (body.op === "upload") {
     // Page op: save one photo/PDF into a subfolder of BINDER_ROOT. Needs the app token.
     if (!authorized(body.token)) return out({ ok: false, error: "unauthorized" });
@@ -1427,6 +1432,94 @@ function binderUpload(body) {
   while (folder.getFilesByName(name).hasNext()) { name = base + " (" + k + ")." + ext; k++; }
   var file = folder.createFile(Utilities.newBlob(bytes, mt, name));
   return { ok: true, folder: sub, name: name, url: file.getUrl(), size: bytes.length };
+}
+
+
+/* ------------------------------------------------------------------ binder: read a label with Claude (page token) */
+
+// POST {token, op:"readlabel", images:[{mimeType, data:<base64>}], have:{field: value already typed}}
+// Needs the script property ANTHROPIC_API_KEY (set by the owner in Project Settings; never in the repo or page)
+// and the script.external_request scope. LABEL_DAILY_MAX caps calls per day so a stuck phone can't run up a bill.
+var LABEL_MODEL = "claude-opus-5-5";
+var LABEL_DAILY_MAX = 40;
+var LABEL_TYPES = { "image/jpeg": "image", "image/png": "image", "image/webp": "image", "image/gif": "image", "application/pdf": "document" };
+var LABEL_FIELDS = ["item", "brand", "model", "serial", "store", "date", "cost", "warranty", "room", "notes"];
+var LABEL_PROMPT = [
+  "These are photos a homeowner took of one thing they own, to add it to a home inventory: a rating plate or tag, a box, a receipt, an invoice or a manual cover. Read them and fill in what they show about that one item.",
+  "",
+  "- item: a short plain name for what it is, like \"Dehumidifier\" or \"Road bike\" (you may infer this from the brand and model).",
+  "- brand, model: as printed. model is the model number, not a marketing name, when both appear.",
+  "- serial: only a number printed as the serial (S/N, Serial No., SER). Copy it exactly. Never guess or complete one.",
+  "- store: the seller, from a receipt or invoice.",
+  "- date: the purchase date from a receipt, as YYYY-MM-DD. Not a manufacture date.",
+  "- cost: what was paid for this item, as a plain number like 249.99. For a receipt listing several things, the line for this item, not the total.",
+  "- warranty: the date the warranty ends, as YYYY-MM-DD, only when the photos state the term and you know the purchase date.",
+  "- room: only if a photo makes it obvious (a dryer in a laundry room); otherwise leave it empty.",
+  "- notes: anything else worth keeping, in one short line (capacity, size, a manufacture date). Otherwise empty.",
+  "",
+  "Leave a field as an empty string when the photos don't show it; an empty field is much better than a wrong one. List in unsure the fields you filled but can't read clearly."
+].join("\n");
+
+function readLabel(body) {
+  var key = getProp("ANTHROPIC_API_KEY");
+  if (!key) return { ok: false, error: "photo reading isn't set up (no API key in the script settings)" };
+  var images = Array.isArray(body.images) ? body.images.slice(0, 4) : [];
+  if (!images.length) return { ok: false, error: "no photos" };
+  var day = Utilities.formatDate(new Date(), tz(), "yyyy-MM-dd"), used = String(getProp("LABEL_USE") || "").split(":");
+  var count = used[0] === day ? Number(used[1]) || 0 : 0;
+  if (count >= LABEL_DAILY_MAX) return { ok: false, error: "daily limit reached (" + LABEL_DAILY_MAX + " reads); try tomorrow" };
+  var content = [], total = 0;
+  for (var i = 0; i < images.length; i++) {
+    var im = images[i] || {}, mt = s(im.mimeType).toLowerCase(), kind = LABEL_TYPES[mt], data = s(im.data);
+    if (!kind) return { ok: false, error: "photo " + (i + 1) + ": only JPEG, PNG, WebP, GIF or PDF" };
+    total += data.length;
+    if (!data || total > 24 * 1024 * 1024) return { ok: false, error: "photos too large" };
+    content.push({ type: kind, source: { type: "base64", media_type: mt, data: data } });
+  }
+  content.push({ type: "text", text: LABEL_PROMPT });
+  var props = {};
+  LABEL_FIELDS.forEach(function (f) { props[f] = { type: "string" }; });
+  props.unsure = { type: "array", items: { type: "string" } };
+  var req = {
+    model: LABEL_MODEL, max_tokens: 4000,
+    output_config: { effort: "low", format: { type: "json_schema", schema: { type: "object", properties: props,
+      required: LABEL_FIELDS.concat(["unsure"]), additionalProperties: false } } },
+    fallbacks: "default",
+    messages: [{ role: "user", content: content }]
+  };
+  setProp("LABEL_USE", day + ":" + (count + 1));
+  var resp = UrlFetchApp.fetch("https://api.anthropic.com/v1/messages", {
+    method: "post", contentType: "application/json", muteHttpExceptions: true, payload: JSON.stringify(req),
+    headers: { "x-api-key": key, "anthropic-version": "2026-10-21", "anthropic-beta": "server-side-fallback-2026-07-01" }
+  });
+  var code = resp.getResponseCode(), msg;
+  try { msg = JSON.parse(resp.getContentText()); } catch (e) { return { ok: false, error: "unreadable reply (HTTP " + code + ")" }; }
+  if (code !== 200) {
+    var em = msg && msg.error && msg.error.message ? String(msg.error.message) : "HTTP " + code;
+    if (code === 401) em = "the API key was refused; check ANTHROPIC_API_KEY in the script settings";
+    else if (code === 400 && /credit/i.test(em)) em = "the API account is out of credit";
+    return { ok: false, error: em.slice(0, 200) };
+  }
+  if (msg.stop_reason === "refusal") return { ok: false, error: "Claude declined to read these photos" };
+  if (msg.stop_reason === "max_tokens") return { ok: false, error: "the reply was cut short; try fewer photos" };
+  var text = (msg.content || []).filter(function (b) { return b.type === "text"; }).map(function (b) { return b.text; }).join("");
+  var got;
+  try { got = JSON.parse(text); } catch (e) { return { ok: false, error: "couldn't read the result" }; }
+  return { ok: true, fields: cleanLabelFields(got), usage: msg.usage ? { input: msg.usage.input_tokens, output: msg.usage.output_tokens } : null };
+}
+
+// Keep only well-formed values: dates as YYYY-MM-DD, cost as a number, short strings.
+function cleanLabelFields(got) {
+  var f = {}, unsure = [];
+  LABEL_FIELDS.forEach(function (k) {
+    var v = s(got && got[k]);
+    if (!v) return;
+    if ((k === "date" || k === "warranty") && !isDate(v)) return;
+    if (k === "cost") { var n = toNum(v); if (n == null || n < 0) return; v = String(n); }
+    f[k] = v.slice(0, k === "notes" ? 300 : 120);
+  });
+  (Array.isArray(got && got.unsure) ? got.unsure : []).forEach(function (k) { if (f[s(k)] != null && unsure.indexOf(s(k)) < 0) unsure.push(s(k)); });
+  return { values: f, unsure: unsure };
 }
 
 /* ------------------------------------------------------------------ gmail: scan */

@@ -154,6 +154,8 @@ g.DriveApp.searchFiles = (q) => {
   (function walk(f) { f.files.forEach((x) => { if (!x.trashed && x.name.includes(needle)) hits.push(fakeFile(x, f)); }); f.folders.forEach(walk); })(driveRoot);
   return iter(hits);
 };
+let fetches = [], fetchReply = null;
+g.UrlFetchApp = { fetch: (url, opts) => { fetches.push({ url, opts }); const r = fetchReply(url, opts); return { getResponseCode: () => r.code, getContentText: () => JSON.stringify(r.body) }; } };
 Object.assign(global, g);
 // Load the script into the global scope (top-level function declarations become globals).
 (0, eval)(src);
@@ -616,6 +618,37 @@ test("binder files: list under BINDER_ROOT only, upload into a year or Warrantie
   assert.strictEqual(post({ token: props.TOKEN, op: "upload", folder: "2026", name: "x", mimeType: "text/html", data: b64 }).ok, false);
   assert.strictEqual(post({ token: "nope", op: "upload", folder: "2026", name: "x", mimeType: "application/pdf", data: b64 }).error, "unauthorized");
   assert.strictEqual(post({ admin: props.ADMIN_TOKEN, op: "upload", folder: "2026", name: "x", mimeType: "application/pdf", data: b64 }).error, "unauthorized", "upload is a page op");
+});
+
+
+test("readlabel: needs the key and the app token, sends photos to Claude with a schema, keeps only well-formed fields, daily cap", () => {
+  reset(); fetches = []; delete props.ANTHROPIC_API_KEY; delete props.LABEL_USE;
+  const img = { mimeType: "image/jpeg", data: Buffer.from("jpegbytes").toString("base64") };
+  assert.match(post({ token: props.TOKEN, op: "readlabel", images: [img] }).error, /isn't set up/);
+  props.ANTHROPIC_API_KEY = "sk-test";
+  assert.strictEqual(post({ token: "nope", op: "readlabel", images: [img] }).error, "unauthorized");
+  assert.match(post({ token: props.TOKEN, op: "readlabel", images: [{ mimeType: "text/html", data: "x" }] }).error, /only JPEG/);
+  fetchReply = () => ({ code: 200, body: { stop_reason: "end_turn", usage: { input_tokens: 1800, output_tokens: 200 },
+    content: [{ type: "text", text: JSON.stringify({ item: "Dehumidifier", brand: "Aprilaire", model: "E070", serial: "172025A64953", store: "",
+      date: "May 2025", cost: "$1,899.00", warranty: "2030-05-23", room: "Basement", notes: "70 pints/day", unsure: ["serial", "store"] }) }] } });
+  const r = post({ token: props.TOKEN, op: "readlabel", images: [img, { mimeType: "application/pdf", data: "cGRm" }] });
+  assert.deepStrictEqual(r.fields.values, { item: "Dehumidifier", brand: "Aprilaire", model: "E070", serial: "172025A64953", cost: "1899", warranty: "2030-05-23", room: "Basement", notes: "70 pints/day" });
+  assert.deepStrictEqual(r.fields.unsure, ["serial"], "unsure only lists fields that came back");
+  const sent = fetches[fetches.length - 1], body = JSON.parse(sent.opts.payload);
+  assert.strictEqual(sent.url, "https://api.anthropic.com/v1/messages");
+  assert.deepStrictEqual([sent.opts.headers["x-api-key"], sent.opts.headers["anthropic-beta"], body.model, body.fallbacks, body.output_config.effort, body.output_config.format.type],
+                         ["sk-test", "server-side-fallback-2026-07-01", "claude-opus-5-5", "default", "low", "json_schema"]);
+  assert.deepStrictEqual(body.messages[0].content.map((c) => c.type), ["image", "document", "text"]);
+  assert.strictEqual(body.output_config.format.schema.additionalProperties, false);
+  fetchReply = () => ({ code: 401, body: { error: { message: "invalid x-api-key" } } });
+  assert.match(post({ token: props.TOKEN, op: "readlabel", images: [img] }).error, /key was refused/);
+  fetchReply = () => ({ code: 200, body: { stop_reason: "refusal", content: [] } });
+  assert.match(post({ token: props.TOKEN, op: "readlabel", images: [img] }).error, /declined/);
+  props.LABEL_USE = Utilities.formatDate(new Date(), "x", "yyyy-MM-dd") + ":40";
+  const n = fetches.length;
+  assert.match(post({ token: props.TOKEN, op: "readlabel", images: [img] }).error, /daily limit/);
+  assert.strictEqual(fetches.length, n, "no call once the cap is hit");
+  assert.ok(!JSON.stringify(src.match(/LABEL_PROMPT[\s\S]*?join/)[0]).includes("sk-"), "no key in the source");
 });
 
 console.log(passed + " passed" + (process.exitCode ? ", with failures" : ""));

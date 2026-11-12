@@ -109,6 +109,11 @@ The app's Binder tab reads three things beyond the progress tabs:
   path, also a script property); `POST {token, op:"upload", folder:"2026"|"Warranties", name,
   mimeType, data:<base64>}` saves a JPEG/PNG/HEIC/PDF up to 20 MB there, never overwriting.
 
+- **Reading photos** (Items → Take or choose photos): `POST {token, op:"readlabel", images:[{mimeType, data}]}` sends up
+  to 4 photos/PDFs to Claude (`claude-opus-5-5`, low effort, JSON-schema output, server-side refusal fallback) and returns
+  the item fields it can read. Needs the script property `ANTHROPIC_API_KEY` (an Anthropic API key, set only in Project
+  Settings) and the `script.external_request` scope; capped at 40 reads a day (`LABEL_USE`).
+
 `binderprep` sets all three properties while converting the ledger tab, once:
 
 ```
