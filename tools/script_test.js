@@ -106,7 +106,10 @@ function fakeOtherSheet(t) {
       getRow: () => row, getColumn: () => col,
       getDisplayValues: () => slice(row, col, nrows, ncols).map((r) => r.map((v) => (v instanceof Date ? v.toISOString().slice(0, 10) : String(v)))),
       getFormulas: () => slice(row, col, nrows, ncols).map((r) => r.map((v) => (typeof v === "string" && v[0] === "=" ? v : ""))),
-      setValues(vals) { vals.forEach((v, i) => { const r = t.rows[row - 1 + i] || (t.rows[row - 1 + i] = []); v.forEach((x, j) => { r[col - 1 + j] = x; }); }); return this; },
+      setValues(vals) {
+        // A Sheets Table rejects formulas in its header row (row 1 within the table's columns).
+        if (t.tableCols && row === 1) vals[0].forEach((x, j) => { if (col + j <= t.tableCols && typeof x === "string" && x[0] === "=") throw new Error("Exception: Formulas are not supported in a table header row."); });
+        vals.forEach((v, i) => { const r = t.rows[row - 1 + i] || (t.rows[row - 1 + i] = []); v.forEach((x, j) => { r[col - 1 + j] = x; }); }); return this; },
       setRichTextValue: (rt) => { t.rich[row + ":" + col] = rt; },
       getValues: () => slice(row, col, nrows, ncols),
       getRichTextValues: () => Array.from({ length: nrows }, (_, i) => Array.from({ length: ncols }, (_, j) => {
@@ -419,7 +422,7 @@ test("driveList/driveFind read Drive without creating; sheetInfo/sheetGet/sheetP
 
   otherBooks.hc = { name: "house costs", tabs: [
     { name: "Initial", gid: 1, rows: [["a"]], rich: {} },
-    { name: "New House Purchases", gid: 869386941, rich: {},
+    { name: "New House Purchases", gid: 869386941, tableCols: 9, rich: {},
       rows: [["Date", "Cost", "Item", "Whose?", "From", "Notes"], [new Date(2025, 4, 14), 2648, "Moving", "Household", "Golan", "25 - Golan.jpg"]] },
   ] };
   const info = sheetInfo("hc");
@@ -461,7 +464,7 @@ test("driveList/driveFind read Drive without creating; sheetInfo/sheetGet/sheetP
 function houseCosts() {
   return { name: "house costs", tabs: [
     { name: "Initial House Purchase", gid: 0, rows: [["Amount spent", "Date spent"], ["$1", "wire: secret"]], rich: {} },
-    { name: "New House Purchases", gid: 869386941, rich: { "4:6": { text: "a.pdf · b.pdf", links: [[0, 5, "https://d/a"], [8, 13, "https://d/b"]] } },
+    { name: "New House Purchases", gid: 869386941, tableCols: 9, rich: { "4:6": { text: "a.pdf · b.pdf", links: [[0, 5, "https://d/a"], [8, 13, "https://d/b"]] } },
       rows: [["Date", "Cost", "Item", "Whose?", "From", "Notes", "", "", ""],
              [new Date(2025, 4, 14), "$2,648.00", "Moving", "Household", "Golan's Movers", "25 - Golan.jpg", "", "", ""],
              ["tbd", "$5,850.04", "Second half", "Household", "US Waterproofing", "US Waterproofing", "", "Total Spent:", "=SUM(B:B)"],
@@ -503,14 +506,24 @@ test("binderprep: report, refused tabs, plan checks, dry run by default, then ba
   const tab = otherBooks.hc.tabs[1], backup = otherBooks.hc.tabs[3];
   assert.match(backup.name, /^New House Purchases \(backup \d{4}-\d{2}-\d{2}\)$/);
   assert.strictEqual(backup.rows[2][8], "=SUM(B:B)", "backup keeps the original cells");
-  assert.deepStrictEqual(tab.rows[1].slice(0, 12), ["Date", "Cost", "Item", "Whose?", "From", "Notes", "Category", "Capital", "Warranty until", "Files", "id", "updated"]);
-  assert.strictEqual(tab.rows[0][0], "Paid");
-  assert.ok(tab.rows[3].slice(7, 9).every((x) => x !== "Total Spent:" && x !== "=SUM(B:B)"), "old total cell is gone");
-  assert.deepStrictEqual(tab.rows[3].slice(0, 3), ["tbd", 5850.04, "Second half"]);
-  assert.deepStrictEqual(tab.rich["5:10"].links, [[0, 5, "https://d/a"], [8, 13, "https://d/b"]]);
-  assert.deepStrictEqual([tab.frozen, tab.hidden], [2, [11, 2]]);
+  assert.deepStrictEqual(wet.warnings, []);
+  assert.deepStrictEqual(tab.rows[0].slice(0, 12), ["Date", "Cost", "Item", "Whose?", "From", "Notes", "Category", "Capital", "Warranty until", "Files", "id", "updated"]);
+  assert.deepStrictEqual([tab.rows[0][13], tab.rows[1][13], tab.rows[1][14]], ["Paid", "Committed (tbd)", '=SUMIF(A2:A,"tbd",B2:B)'], "totals beside the table");
+  assert.ok(tab.rows[2].slice(7, 9).every((x) => x !== "Total Spent:" && x !== "=SUM(B:B)"), "old total cell is gone");
+  assert.deepStrictEqual(tab.rows[2].slice(0, 3), ["tbd", 5850.04, "Second half"], "rows keep their positions");
+  assert.deepStrictEqual(tab.rich["4:10"].links, [[0, 5, "https://d/a"], [8, 13, "https://d/b"]]);
+  assert.deepStrictEqual(tab.hidden, [11, 2]);
   assert.deepStrictEqual([props.HISTORY_ID, props.HISTORY_GID, props.BINDER_ROOT], ["hc", "869386941", "Binder"]);
   assert.match(post(Object.assign(prepPlan(), { dry: false })).error, /original layout/, "never runs twice");
+
+  // A failure in the main write leaves the original rows where they were (nothing is cleared first).
+  otherBooks.hc = houseCosts(); const before = JSON.stringify(otherBooks.hc.tabs[1].rows);
+  const origSet = g.SpreadsheetApp.openById;
+  g.SpreadsheetApp.openById = global.SpreadsheetApp.openById = (id) => { const b = origSet(id); const gs = b.getSheets; b.getSheets = () => gs().map((sh) => { const gr = sh.getRange; sh.getRange = (a, c, n, m) => { const r = gr(a, c, n, m); if (a === 2 && n > 1) r.setValues = () => { throw new Error("boom"); }; return r; }; return sh; }); return b; };
+  assert.match(post(Object.assign(prepPlan(), { dry: false })).error, /boom/);
+  g.SpreadsheetApp.openById = global.SpreadsheetApp.openById = origSet;
+  assert.strictEqual(JSON.stringify(otherBooks.hc.tabs[1].rows), before, "tab unchanged after a failed write");
+  otherBooks.hc.tabs.splice(3); const again = post(Object.assign(prepPlan(), { dry: false })); assert.strictEqual(again.ok, true);
 });
 
 test("history: page token reads the one tab, edits by id with newest-u-wins, appends, deletes; other tabs refused", () => {

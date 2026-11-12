@@ -1133,10 +1133,12 @@ function normalizeInv(v) {
 
 /* ------------------------------------------------------------------ binder: history (house-costs tab) */
 
-// Layout after binderprep: row 1 totals, row 2 this header, data from row 3. Columns K:L are hidden.
+// Layout after binderprep: row 1 this header (the ledger tab is a Sheets Table, whose header row must stay
+// row 1 and cannot hold formulas), data from row 2, id/updated in hidden K:L, totals in N1:O2 beside the table.
 var HIST_HEADER = ["Date", "Cost", "Item", "Whose?", "From", "Notes", "Category", "Capital", "Warranty until", "Files", "id", "updated"];
 var HIST_ORIGINAL = ["Date", "Cost", "Item", "Whose?", "From", "Notes"];
-var HIST_COLS = HIST_HEADER.length, HIST_FIRST = 3;
+var HIST_TOTALS = [["Paid", "=SUMIF(A2:A,\">0\",B2:B)"], ["Committed (tbd)", "=SUMIF(A2:A,\"tbd\",B2:B)"]];
+var HIST_COLS = HIST_HEADER.length, HIST_FIRST = 2;
 var HIST_CATEGORIES = ["heating & A/C", "plumbing & sewer", "exterior & masonry", "roof & attic", "electrical", "pest",
                        "appliances", "moving & closing", "other"];
 // Tabs of the house-costs ledger the binder must never configure or touch: the purchase tab holds
@@ -1148,7 +1150,7 @@ function historyTab() {
   if (!id || gid == null || gid === "") throw new Error("history not configured (run binderprep)");
   if (HIST_DENY_GIDS.indexOf(Number(gid)) >= 0) throw new Error("refused tab");
   var t = otherTab(id, { gid: gid });
-  var head = t.sh.getRange(2, 1, 1, HIST_COLS).getValues()[0].map(s);
+  var head = t.sh.getRange(1, 1, 1, HIST_COLS).getValues()[0].map(s);
   if (head.join("|") !== HIST_HEADER.join("|")) throw new Error("history tab is not in the binder layout");
   t.tz = t.ss.getSpreadsheetTimeZone();
   return t;
@@ -1272,15 +1274,16 @@ function binderPrepReport(id, which) {
   var display = last ? sh.getRange(1, 1, last, cols).getDisplayValues() : [];
   var rich = last ? sh.getRange(1, 6, last, 1).getRichTextValues() : [];
   return { ok: true, tab: sh.getName(), gid: sh.getSheetId(), tz: t.ss.getSpreadsheetTimeZone(), rows: last, cols: cols,
-           prepared: last >= 2 && sh.getRange(2, 1, 1, HIST_COLS).getValues()[0].map(s).join("|") === HIST_HEADER.join("|"),
+           prepared: last >= 1 && sh.getRange(1, 1, 1, HIST_COLS).getValues()[0].map(s).join("|") === HIST_HEADER.join("|"),
            values: display, notesLinks: rich.map(function (r, i) { return { row: i + 1, links: richRuns(r[0]) }; }).filter(function (x) { return x.links.length; }),
            configured: { id: getProp("HISTORY_ID") || "", gid: getProp("HISTORY_GID") || "", root: getProp("BINDER_ROOT") || "" } };
 }
 
 // POST {admin, op:"binderprep", id, gid, root, dry, rows:[{row, item, id, date, category, capital, warranty, files, notes}]}
 // The plan must name every data row of the original layout (rows 2..last) by its row number and item text,
-// or nothing is written. Without dry: copies the tab to "<name> (backup YYYY-MM-DD)", rewrites it in the
-// binder layout (totals row 1, header row 2, data row 3+, ids and stamps in hidden K:L), and records
+// or nothing is written. Without dry: copies the tab to "<name> (backup YYYY-MM-DD)", rewrites it in place in
+// the binder layout (header row 1 gains G:L, rows keep their positions, ids and stamps in hidden K:L,
+// totals in N1:O2 replace the old one), and records
 // HISTORY_ID / HISTORY_GID / BINDER_ROOT.
 function binderPrep(body) {
   var id = s(body.id), gid = body.gid;
@@ -1291,7 +1294,8 @@ function binderPrep(body) {
   var t = otherTab(id, { gid: gid }), sh = t.sh, zone = t.ss.getSpreadsheetTimeZone();
   var last = sh.getLastRow(), cols = Math.max(sh.getLastColumn(), HIST_COLS);
   var grid = sh.getRange(1, 1, last, cols).getValues(), shown = sh.getRange(1, 1, last, cols).getDisplayValues();
-  if (grid[0].slice(0, 6).map(s).join("|") !== HIST_ORIGINAL.join("|")) return { ok: false, error: "tab is not in the original layout (already prepared?)" };
+  if (grid[0].slice(0, 6).map(s).join("|") !== HIST_ORIGINAL.join("|") || grid[0].slice(6, HIST_COLS).some(function (x) { return s(x) !== ""; }))
+    return { ok: false, error: "tab is not in the original layout (already prepared?)" };
   var plan = Array.isArray(body.rows) ? body.rows : [], byRow = {}, errors = [];
   plan.forEach(function (p) { byRow[Number(p.row)] = p; });
   var dataRows = [];
@@ -1316,9 +1320,9 @@ function binderPrep(body) {
 
   var now = new Date().toISOString();
   var after = dataRows.map(function (d) { d.v.u = now; return historyCells(d.id, d.v, zone); });
-  var preview = { totals: ["Paid", "=SUMIF(A3:A,\">0\",B3:B)", "=\"Committed (tbd): \"&TEXT(SUMIF(A3:A,\"tbd\",B3:B),\"$#,##0.00\")"],
+  var preview = { totals: HIST_TOTALS,
                   header: HIST_HEADER,
-                  rows: dataRows.map(function (d, i) { return { from: d.from, to: HIST_FIRST + i, before: shown[d.from - 1].slice(0, 9),
+                  rows: dataRows.map(function (d, i) { return { from: d.from, to: d.from, before: shown[d.from - 1].slice(0, 9),
                                                                after: after[i].map(function (c) { return isDateObj(c) ? Utilities.formatDate(c, zone, "yyyy-MM-dd") : c; }),
                                                                files: d.v.files }; }) };
   if (body.dry !== false) return { ok: true, dry: true, tab: sh.getName(), backup: sh.getName() + " (backup " + Utilities.formatDate(new Date(), zone, "yyyy-MM-dd") + ")", preview: preview };
@@ -1329,24 +1333,35 @@ function binderPrep(body) {
     var backupName = sh.getName() + " (backup " + Utilities.formatDate(new Date(), zone, "yyyy-MM-dd") + ")";
     if (t.ss.getSheetByName(backupName)) return { ok: false, error: "backup tab already exists: " + backupName };
     sh.copyTo(t.ss).setName(backupName);
-    sh.getRange(1, 1, last, cols).clear();
-    sh.getRange(1, 1, 1, 3).setValues([preview.totals]);
-    sh.getRange(2, 1, 1, HIST_COLS).setValues([HIST_HEADER]).setFontWeight("bold");
-    if (after.length) {
-      sh.getRange(HIST_FIRST, 1, after.length, HIST_COLS).setValues(after);
-      sh.getRange(HIST_FIRST, 1, after.length, 1).setNumberFormat("m/d/yyyy");
-      sh.getRange(HIST_FIRST, 2, after.length, 1).setNumberFormat("$#,##0.00");
-      sh.getRange(HIST_FIRST, 9, after.length, 1).setNumberFormat("m/d/yyyy");
-      dataRows.forEach(function (d, i) { setFilesCell(sh, HIST_FIRST + i, d.v.files); });
+    // Nothing is cleared: one setValues rewrites rows 2..last in place (each row keeps its position), and
+    // only then do the header cells G1:L1, link cells, formats and totals follow. If that first write
+    // fails, the tab is unchanged.
+    var block = [], k = 0;
+    for (var rr = 2; rr <= last; rr++) {
+      if (dataRows[k] && dataRows[k].from === rr) { block.push(after[k]); k++; }
+      else block.push(grid[rr - 1].slice(0, HIST_COLS).concat(new Array(Math.max(0, HIST_COLS - grid[rr - 1].length))).map(function (x) { return x == null ? "" : x; }));
     }
-    sh.getRange(1, 2, 1, 1).setNumberFormat("$#,##0.00");
-    sh.setFrozenRows(2);
-    sh.hideColumns(11, 2);
+    if (block.length) sh.getRange(2, 1, block.length, HIST_COLS).setValues(block);
+    sh.getRange(1, 7, 1, HIST_COLS - 6).setValues([HIST_HEADER.slice(6)]);
+    var warnings = [];
+    dataRows.forEach(function (d) {
+      try { setFilesCell(sh, d.from, d.v.files); } catch (e) { warnings.push("files row " + d.from + ": " + e); }
+    });
+    try {
+      sh.getRange(2, 1, last - 1, 1).setNumberFormat("m/d/yyyy");
+      sh.getRange(2, 2, last - 1, 1).setNumberFormat("$#,##0.00");
+      sh.getRange(2, 9, last - 1, 1).setNumberFormat("m/d/yyyy");
+      sh.hideColumns(11, 2);
+    } catch (e) { warnings.push("formats: " + e); }
+    try {
+      sh.getRange(1, 14, 2, 2).setValues(HIST_TOTALS);
+      sh.getRange(1, 15, 2, 1).setNumberFormat("$#,##0.00");
+    } catch (e) { warnings.push("totals: " + e); }
     setProp("HISTORY_ID", id);
     setProp("HISTORY_GID", String(sh.getSheetId()));
     setProp("BINDER_ROOT", root);
   } finally { lock.releaseLock(); }
-  return { ok: true, dry: false, tab: sh.getName(), backup: backupName, rows: after.length };
+  return { ok: true, dry: false, tab: sh.getName(), backup: backupName, rows: after.length, warnings: warnings };
 }
 
 /* ------------------------------------------------------------------ binder: Drive (page token) */
