@@ -572,11 +572,20 @@ test("docs + inventory sync like bills: newest u wins, bad kinds and dates refus
                    files: [{ t: "carrier.pdf", u: "https://d/c" }, { t: "x", u: "javascript:alert(1)" }], u: "2026-11-12T00:00:00.000Z" },
     "d-ho": { title: "USAA homeowners", kind: "policy", expires: "2027-05-07", policy: { dwelling: 400000, ho208: "$10,000", bad: { x: 1 } }, u: "2026-11-12T00:00:00.000Z" },
     "d-x": { title: "x", kind: "spaceship" }, "d-y": { title: "y", expires: "May 7" },
-  }, inventory: { "i-bike": { item: "Bike", room: "Garage", cost: "1,200", date: "2025-06-01", u: "2026-11-12T00:00:00.000Z" } } });
+  }, inventory: { "i-bike": { item: "Bike", room: "Garage", cost: "1,200", date: "2025-06-01", brand: "Trek", model: "FX 3", serial: "WTU123",
+                               store: "REI", manual: "https://trek.example/fx3.pdf", warranty: "2027-06-01", u: "2026-11-12T00:00:00.000Z" },
+                  "i-bad": { item: "Bad", manual: "javascript:alert(1)" }, "i-bad2": { item: "Bad2", warranty: "June" } } });
   assert.deepStrictEqual(Object.keys(res.docs).sort(), ["d-carrier", "d-ho"]);
   assert.deepStrictEqual(res.docs["d-carrier"].files, [{ t: "carrier.pdf", u: "https://d/c" }]);
   assert.deepStrictEqual(res.docs["d-ho"].policy, { dwelling: 400000, ho208: "$10,000" });
   assert.strictEqual(res.inventory["i-bike"].cost, 1200);
+  assert.deepStrictEqual(Object.keys(res.inventory), ["i-bike"], "non-https manual and bad warranty dates are refused");
+  assert.deepStrictEqual(["brand", "model", "serial", "store", "manual", "warranty"].map((k) => res.inventory["i-bike"][k]),
+                         ["Trek", "FX 3", "WTU123", "REI", "https://trek.example/fx3.pdf", "2027-06-01"]);
+  // A tab created before these columns existed: rows are 9 wide, and still read.
+  tabs.inventory.rows.push(["i-old", "Lamp", "Den", "80", "", "", "", "2026-11-01T00:00:00.000Z", ""]);
+  assert.strictEqual(get({ token: props.TOKEN }).inventory["i-old"].serial, "");
+  tabs.inventory.rows.pop();
   const back = get({ token: props.TOKEN });
   assert.deepStrictEqual(back.docs, res.docs, "round-trips through the Sheet");
   assert.deepStrictEqual(back.inventory, res.inventory);

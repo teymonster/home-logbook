@@ -1,5 +1,5 @@
 /**
- * Home Logbook — Google Apps Script web app (v15).
+ * Home Logbook — Google Apps Script web app (v16).
  *
  * Bound to the "Home Logbook progress" Sheet. Tabs, created on first use:
  *   log          id | last | history | updated | deleted                    (task tick-offs)
@@ -16,7 +16,9 @@
  *   budget       category | target | note | updated | deleted             (budget: monthly targets)
  *   docs         id | title | kind | date | expires | equipment | files | notes | policy | updated | deleted
  *                (binder documents & warranties; files = JSON [{t,u}] Drive links; policy = JSON coverage fields)
- *   inventory    id | item | room | cost | date | files | notes | updated | deleted   (binder: high-value items)
+ *   inventory    id | item | room | cost | date | files | notes | updated | deleted | brand | model | serial |
+ *                store | manual | warranty   (binder Items; the six after deleted were added later, so older rows keep
+ *                their layout; serial is the owner's, shown in the app, never sent to Ask)
  *
  * Binder History (v15) lives in ANOTHER spreadsheet: one tab of the owner's house-costs ledger, named by the
  * script properties HISTORY_ID + HISTORY_GID (set by the admin op binderprep, never hard-coded here). The
@@ -44,7 +46,7 @@
  * typo in the Sheet can never cause rows to be dropped.
  */
 
-var VERSION = 15;
+var VERSION = 16;
 var CADENCES = ["weekly", "monthly", "bimonthly", "quarterly", "semiannual", "annual"];
 var SCAN_DAYS = 40;             // default look-back for the daily / on-demand scan
 var SCAN_MIN_GAP_MS = 5 * 60 * 1000;
@@ -85,7 +87,7 @@ var COLLECTIONS = {
     fromRow: docFromRow, toRow: docToRow, normalize: normalizeDoc
   },
   inventory: {
-    header: ["id", "item", "room", "cost", "date", "files", "notes", "updated", "deleted"],
+    header: ["id", "item", "room", "cost", "date", "files", "notes", "updated", "deleted", "brand", "model", "serial", "store", "manual", "warranty"],
     fromRow: invFromRow, toRow: invToRow, normalize: normalizeInv
   }
 };
@@ -1116,13 +1118,15 @@ function invFromRow(r, ctx) {
   if (!id) id = "i-" + uniqueSlug(item, ctx.ids);
   var updated = isoOf(r[7]) || ctx.now;
   if (s(r[8]).toUpperCase() === "TRUE") return [id, { del: true, u: updated }];
-  var v = normalizeInv({ item: item, room: s(r[2]), cost: r[3], date: dateStr(r[4]), files: filesFromCell(r[5]), notes: s(r[6]), u: updated });
+  var v = normalizeInv({ item: item, room: s(r[2]), cost: r[3], date: dateStr(r[4]), files: filesFromCell(r[5]), notes: s(r[6]), u: updated,
+                         brand: s(r[9]), model: s(r[10]), serial: s(r[11]), store: s(r[12]), manual: s(r[13]), warranty: dateStr(r[14]) });
   if (!v) { ctx.unreadable.push(id); return null; }
   return [id, v];
 }
 function invToRow(id, v) {
-  if (v.del) return [id, "", "", "", "", "", "", v.u || "", "TRUE"];
-  return [id, v.item, v.room || "", numStr(v.cost), v.date || "", filesToCell(v.files), v.notes || "", v.u || "", ""];
+  if (v.del) return [id, "", "", "", "", "", "", v.u || "", "TRUE", "", "", "", "", "", ""];
+  return [id, v.item, v.room || "", numStr(v.cost), v.date || "", filesToCell(v.files), v.notes || "", v.u || "", "",
+          v.brand || "", v.model || "", v.serial || "", v.store || "", v.manual || "", v.warranty || ""];
 }
 function normalizeInv(v) {
   if (!v || typeof v !== "object") return null;
@@ -1130,10 +1134,14 @@ function normalizeInv(v) {
   if (v.del) return { del: true, u: isoOf(v.u) || now };
   var item = s(v.item);
   if (!item) return null;
-  var date = s(v.date);
+  var date = s(v.date), warranty = s(v.warranty), manual = s(v.manual);
   if (date && !isDate(date)) return null;
+  if (warranty && !isDate(warranty)) return null;
+  if (manual && !/^https:\/\//.test(manual)) return null;
   return { item: item.slice(0, 200), room: s(v.room).slice(0, 60), cost: toNum(v.cost), date: date,
-           files: normalizeFiles(v.files), notes: s(v.notes).slice(0, 2000), u: isoOf(v.u) || now };
+           files: normalizeFiles(v.files), notes: s(v.notes).slice(0, 2000), u: isoOf(v.u) || now,
+           brand: s(v.brand).slice(0, 80), model: s(v.model).slice(0, 80), serial: s(v.serial).slice(0, 80),
+           store: s(v.store).slice(0, 80), manual: manual.slice(0, 500), warranty: warranty };
 }
 
 /* ------------------------------------------------------------------ binder: history (house-costs tab) */
