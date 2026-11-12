@@ -1349,12 +1349,11 @@ function binderPrep(body) {
     dataRows.forEach(function (d) {
       try { setFilesCell(sh, d.from, d.v.files); } catch (e) { warnings.push("files row " + d.from + ": " + e); }
     });
-    try {
-      sh.getRange(2, 1, last - 1, 1).setNumberFormat("m/d/yyyy");
-      sh.getRange(2, 2, last - 1, 1).setNumberFormat("$#,##0.00");
-      sh.getRange(2, 9, last - 1, 1).setNumberFormat("m/d/yyyy");
-      sh.hideColumns(11, 2);
-    } catch (e) { warnings.push("formats: " + e); }
+    // Each step on its own: a Sheets Table's typed columns refuse formats, which must not stop the rest.
+    [[1, "m/d/yyyy"], [2, "$#,##0.00"], [9, "m/d/yyyy"]].forEach(function (f) {
+      try { sh.getRange(2, f[0], last - 1, 1).setNumberFormat(f[1]); } catch (e) { warnings.push("formats: " + e); }
+    });
+    try { sh.hideColumns(11, 2); } catch (e) { warnings.push("hide K:L: " + e); }
     try {
       sh.getRange(1, 14, 2, 2).setValues(HIST_TOTALS);
       sh.getRange(1, 15, 2, 1).setNumberFormat("$#,##0.00");
