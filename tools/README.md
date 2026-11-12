@@ -96,6 +96,32 @@ CSV exports, `rules.json` maps merchants to categories and default tags, `cache/
 Sheet and the proposal, `report.md` is the breakdown. The daily `scanBudgetDaily` trigger keeps
 harvesting new emails; `installTrigger` installs both triggers.
 
+## Binder (v15)
+
+The app's Binder tab reads three things beyond the progress tabs:
+
+- **History** is one tab of the owner's house-costs ledger (another spreadsheet). The script
+  properties `HISTORY_ID` and `HISTORY_GID` name it; the page token can read and edit only that
+  tab (`GET ?token=&binder=1`, `POST {token, history:{id:{...,u}}}`, newest `u` wins, stale edits
+  are reported, never applied). The ledger's purchase tab and store-receipts tab are refused by gid.
+- **docs** and **inventory** are tabs in the progress Sheet and sync like bills.
+- **Files**: `GET ?token=&op=files[&folder=2026]` lists one level below `BINDER_ROOT` (a Drive
+  path, also a script property); `POST {token, op:"upload", folder:"2026"|"Warranties", name,
+  mimeType, data:<base64>}` saves a JPEG/PNG/HEIC/PDF up to 20 MB there, never overwriting.
+
+`binderprep` sets all three properties while converting the ledger tab, once:
+
+```
+python3 tools/sheetops.py binderprep <id> --gid <gid>                  # report: cells + Notes links
+python3 tools/sheetops.py binderprep <id> --gid <gid> --plan plan.json # preview (writes nothing)
+python3 tools/sheetops.py binderprep <id> --gid <gid> --plan plan.json --apply
+```
+
+The plan names every data row by row number and item text, with its id, category, capital flag,
+warranty date, files and notes; a mismatch rejects the whole plan. `--apply` copies the tab to
+`<name> (backup YYYY-MM-DD)` first, then writes totals in row 1, the header in row 2, data from
+row 3, and hides the id/updated columns K:L.
+
 ## Devices
 
 - A device remembers the passphrase until you open the site with `?staticrypt_logout` on

@@ -6,6 +6,8 @@
   python3 tools/sheetops.py sheetinfo <spreadsheetId>
   python3 tools/sheetops.py sheetget <spreadsheetId> --gid 869386941 [--max 500]
   python3 tools/sheetops.py sheetput <spreadsheetId> --gid 869386941 rows.json [--range B5] [--dry]
+  python3 tools/sheetops.py binderprep <spreadsheetId> --gid 869386941            # read-only report
+  python3 tools/sheetops.py binderprep <spreadsheetId> --gid 869386941 --plan plan.json [--apply]
 
 rows.json is a JSON array of rows; a cell is a value, {"d":"YYYY-MM-DD"} (date cell) or
 {"rt":[{"t":"text","u":"url"}, ...]} (rich text with links). Output is the script's JSON.
@@ -58,6 +60,9 @@ def main():
     g = sub.add_parser("sheetget"); g.add_argument("id"); g.add_argument("--gid"); g.add_argument("--tab"); g.add_argument("--max", type=int)
     w = sub.add_parser("sheetput"); w.add_argument("id"); w.add_argument("rows"); w.add_argument("--gid"); w.add_argument("--tab")
     w.add_argument("--range"); w.add_argument("--dry", action="store_true", help="print the request instead of sending it")
+    b = sub.add_parser("binderprep"); b.add_argument("id"); b.add_argument("--gid", required=True)
+    b.add_argument("--plan", help='JSON {"root": "<Drive folder>", "rows": [...]}; without --apply the script only previews')
+    b.add_argument("--apply", action="store_true", help="really back up and rewrite the tab")
     a = ap.parse_args()
     c = cfg()
     if a.op == "drivels":
@@ -68,6 +73,12 @@ def main():
         out = get(c, op="sheetinfo", id=a.id)
     elif a.op == "sheetget":
         out = get(c, op="sheetget", id=a.id, gid=a.gid, tab=a.tab, max=a.max)
+    elif a.op == "binderprep" and not a.plan:
+        out = get(c, op="binderprep", id=a.id, gid=a.gid)
+    elif a.op == "binderprep":
+        with open(a.plan) as f:
+            plan = json.load(f)
+        out = post(c, {"op": "binderprep", "id": a.id, "gid": a.gid, "root": plan.get("root", ""), "rows": plan.get("rows", []), "dry": not a.apply})
     else:
         with open(a.rows) as f:
             values = json.load(f)

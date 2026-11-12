@@ -106,13 +106,29 @@ function fakeOtherSheet(t) {
       getRow: () => row, getColumn: () => col,
       getDisplayValues: () => slice(row, col, nrows, ncols).map((r) => r.map((v) => (v instanceof Date ? v.toISOString().slice(0, 10) : String(v)))),
       getFormulas: () => slice(row, col, nrows, ncols).map((r) => r.map((v) => (typeof v === "string" && v[0] === "=" ? v : ""))),
-      setValues: (vals) => { vals.forEach((v, i) => { const r = t.rows[row - 1 + i] || (t.rows[row - 1 + i] = []); v.forEach((x, j) => { r[col - 1 + j] = x; }); }); },
+      setValues(vals) { vals.forEach((v, i) => { const r = t.rows[row - 1 + i] || (t.rows[row - 1 + i] = []); v.forEach((x, j) => { r[col - 1 + j] = x; }); }); return this; },
       setRichTextValue: (rt) => { t.rich[row + ":" + col] = rt; },
+      getValues: () => slice(row, col, nrows, ncols),
+      getRichTextValues: () => Array.from({ length: nrows }, (_, i) => Array.from({ length: ncols }, (_, j) => {
+        const rt = t.rich[(row + i) + ":" + (col + j)];
+        return { getRuns: () => (rt ? rt.links.map(([a, b, u]) => ({ getText: () => rt.text.slice(a, b), getLinkUrl: () => u })) : []) };
+      })),
+      clear: () => { for (let i = 0; i < nrows; i++) { const r = t.rows[row - 1 + i]; if (r) for (let j = 0; j < ncols; j++) r[col - 1 + j] = ""; for (let j = 0; j < ncols; j++) delete t.rich[(row + i) + ":" + (col + j)]; } },
+      setNumberFormat() { return this; }, setFontWeight() { return this; },
     };
   }
   return {
     getName: () => t.name, getSheetId: () => t.gid,
-    getLastRow: () => t.rows.length, getLastColumn: () => Math.max(0, ...t.rows.map((r) => r.length)),
+    getLastRow: () => { let n = t.rows.length; while (n && !(t.rows[n - 1] || []).some((x) => x !== "" && x != null)) n--; return n; },
+    getLastColumn: () => Math.max(0, ...t.rows.map((r) => r.length)),
+    deleteRow: (r) => {
+      t.rows.splice(r - 1, 1);
+      const moved = {};
+      Object.keys(t.rich).forEach((k) => { const [rr, cc] = k.split(":").map(Number); if (rr < r) moved[k] = t.rich[k]; else if (rr > r) moved[(rr - 1) + ":" + cc] = t.rich[k]; });
+      t.rich = moved;
+    },
+    copyTo: (book) => { const copy = { name: t.name + " copy", gid: 9999, rows: t.rows.map((r) => r.slice()), rich: Object.assign({}, t.rich) }; book._b.tabs.push(copy); return { setName: (n) => { copy.name = n; } }; },
+    setFrozenRows: (n) => { t.frozen = n; }, hideColumns: (c, n) => { t.hidden = [c, n]; },
     getRange: (a, b, c, d) => {
       if (typeof a === "string") { const m = /^([A-Z]+)(\d+)$/.exec(a); return rangeObj(Number(m[2]), m[1].charCodeAt(0) - 64, 1, 1); }
       return rangeObj(a, b, c || 1, d || 1);
@@ -121,7 +137,7 @@ function fakeOtherSheet(t) {
 }
 g.SpreadsheetApp.openById = (id) => {
   const b = otherBooks[id]; if (!b) throw new Error("not found: " + id);
-  return { getName: () => b.name, getUrl: () => "url:" + id, getSpreadsheetTimeZone: () => b.tz || "America/Chicago", getSheets: () => b.tabs.map(fakeOtherSheet),
+  return { _b: b, getName: () => b.name, getUrl: () => "url:" + id, getSpreadsheetTimeZone: () => b.tz || "America/Chicago", getSheets: () => b.tabs.map(fakeOtherSheet),
            getSheetByName: (n) => { const t = b.tabs.find((x) => x.name === n); return t ? fakeOtherSheet(t) : null; } };
 };
 g.SpreadsheetApp.newRichTextValue = () => { const rt = { text: "", links: [] }; const b = { setText(x) { rt.text = x; return b; }, setLinkUrl(s0, e0, u) { rt.links.push([s0, e0, u]); return b; }, build: () => rt }; return b; };
@@ -325,7 +341,7 @@ test("writeAll orders transactions newest first and formats the tab once", () =>
 test("GET without budget=1 is unchanged; with it the three tabs come back", () => {
   reset();
   const plain = JSON.parse(doGet({ parameter: { token: props.TOKEN } }).text);
-  assert.deepStrictEqual(Object.keys(plain).sort(), ["bills", "lastScan", "log", "ok", "payments", "version"]);
+  assert.deepStrictEqual(Object.keys(plain).sort(), ["bills", "docs", "inventory", "lastScan", "log", "ok", "payments", "version"]);
   const full = JSON.parse(doGet({ parameter: { token: props.TOKEN, budget: "1" } }).text);
   assert.ok("transactions" in full && "receipts" in full && "budget" in full && "lastBudgetScan" in full);
 });
@@ -438,6 +454,144 @@ test("driveList/driveFind read Drive without creating; sheetInfo/sheetGet/sheetP
   const get = (q) => JSON.parse(doGet({ parameter: q }).text);
   assert.strictEqual(get({ admin: props.ADMIN_TOKEN, op: "sheetinfo", id: "hc" }).name, "house costs");
   assert.strictEqual(get({ admin: props.ADMIN_TOKEN, op: "drivels", folder: "House/2026" }).files.length, 1);
+});
+
+
+// ---- binder (v15) ------------------------------------------------------------------------------
+function houseCosts() {
+  return { name: "house costs", tabs: [
+    { name: "Initial House Purchase", gid: 0, rows: [["Amount spent", "Date spent"], ["$1", "wire: secret"]], rich: {} },
+    { name: "New House Purchases", gid: 869386941, rich: { "4:6": { text: "a.pdf · b.pdf", links: [[0, 5, "https://d/a"], [8, 13, "https://d/b"]] } },
+      rows: [["Date", "Cost", "Item", "Whose?", "From", "Notes", "", "", ""],
+             [new Date(2025, 4, 14), "$2,648.00", "Moving", "Household", "Golan's Movers", "25 - Golan.jpg", "", "", ""],
+             ["tbd", "$5,850.04", "Second half", "Household", "US Waterproofing", "US Waterproofing", "", "Total Spent:", "=SUM(B:B)"],
+             [new Date(2026, 1, 3), "$1,000.00", "Attic deposit", "Household", "Green Attic", "a.pdf · b.pdf", "", "", ""]] },
+    { name: "bs house junk i bought", gid: 513924073, rows: [["Date"]], rich: {} },
+  ] };
+}
+const prepPlan = () => ({ admin: props.ADMIN_TOKEN, op: "binderprep", id: "hc", gid: 869386941, root: "Binder", rows: [
+  { row: 2, item: "Moving", id: "h-2025-05-14-moving", date: "2025-05-14", category: "moving & closing", capital: false },
+  { row: 3, item: "Second half", id: "h-tbd-waterproofing-2", date: "tbd", category: "exterior & masonry", capital: true },
+  { row: 4, item: "Attic deposit", id: "h-2026-02-03-attic", date: "2026-02-03", category: "roof & attic", capital: true, warranty: "2036-02-04",
+    files: [{ t: "a.pdf", u: "https://d/a" }, { t: "b.pdf", u: "https://d/b" }], notes: "Zelle $1 + $999" },
+] });
+const post = (b) => JSON.parse(doPost({ postData: { contents: JSON.stringify(b) } }).text);
+const get = (q) => JSON.parse(doGet({ parameter: q }).text);
+
+test("binderprep: report, refused tabs, plan checks, dry run by default, then backup + rewrite + config", () => {
+  reset(); otherBooks.hc = houseCosts(); delete props.HISTORY_ID; delete props.HISTORY_GID; delete props.BINDER_ROOT;
+  const rep = get({ admin: props.ADMIN_TOKEN, op: "binderprep", id: "hc", gid: "869386941" });
+  assert.deepStrictEqual([rep.ok, rep.prepared, rep.notesLinks], [true, false, [{ row: 4, links: [{ t: "a.pdf", u: "https://d/a" }, { t: "b.pdf", u: "https://d/b" }] }]]);
+  assert.strictEqual(get({ admin: props.ADMIN_TOKEN, op: "binderprep", id: "hc", gid: "0" }).error, "refused tab");
+  assert.strictEqual(post(Object.assign(prepPlan(), { gid: 513924073 })).error, "refused tab");
+  assert.strictEqual(post(Object.assign(prepPlan(), { token: props.TOKEN, admin: undefined })).error, "unauthorized", "the page token cannot run it");
+
+  const short = prepPlan(); short.rows.pop();
+  assert.deepStrictEqual(post(short).problems, ["row 4 missing from plan"]);
+  const wrong = prepPlan(); wrong.rows[0].date = "2025-05-15"; wrong.rows[2].item = "Attic";
+  assert.strictEqual(post(wrong).problems.length, 2);
+  const tbd = prepPlan(); tbd.rows[0].date = "tbd";
+  assert.match(post(tbd).problems[0], /dated in the sheet/);
+
+  const dry = post(prepPlan());
+  assert.deepStrictEqual([dry.ok, dry.dry, dry.preview.rows.length, dry.preview.rows[1].after[0], dry.preview.rows[2].after[1]], [true, true, 3, "tbd", 1000]);
+  assert.strictEqual(otherBooks.hc.tabs.length, 3, "dry run writes nothing");
+  assert.strictEqual(props.HISTORY_ID, undefined);
+
+  const wet = post(Object.assign(prepPlan(), { dry: false }));
+  assert.deepStrictEqual([wet.ok, wet.rows], [true, 3]);
+  const tab = otherBooks.hc.tabs[1], backup = otherBooks.hc.tabs[3];
+  assert.match(backup.name, /^New House Purchases \(backup \d{4}-\d{2}-\d{2}\)$/);
+  assert.strictEqual(backup.rows[2][8], "=SUM(B:B)", "backup keeps the original cells");
+  assert.deepStrictEqual(tab.rows[1].slice(0, 12), ["Date", "Cost", "Item", "Whose?", "From", "Notes", "Category", "Capital", "Warranty until", "Files", "id", "updated"]);
+  assert.strictEqual(tab.rows[0][0], "Paid");
+  assert.ok(tab.rows[3].slice(7, 9).every((x) => x !== "Total Spent:" && x !== "=SUM(B:B)"), "old total cell is gone");
+  assert.deepStrictEqual(tab.rows[3].slice(0, 3), ["tbd", 5850.04, "Second half"]);
+  assert.deepStrictEqual(tab.rich["5:10"].links, [[0, 5, "https://d/a"], [8, 13, "https://d/b"]]);
+  assert.deepStrictEqual([tab.frozen, tab.hidden], [2, [11, 2]]);
+  assert.deepStrictEqual([props.HISTORY_ID, props.HISTORY_GID, props.BINDER_ROOT], ["hc", "869386941", "Binder"]);
+  assert.match(post(Object.assign(prepPlan(), { dry: false })).error, /original layout/, "never runs twice");
+});
+
+test("history: page token reads the one tab, edits by id with newest-u-wins, appends, deletes; other tabs refused", () => {
+  // continues from the prepared ledger above
+  const r = get({ token: props.TOKEN, binder: "1" });
+  assert.deepStrictEqual(Object.keys(r.history).sort(), ["h-2025-05-14-moving", "h-2026-02-03-attic", "h-tbd-waterproofing-2"]);
+  const attic = r.history["h-2026-02-03-attic"];
+  assert.deepStrictEqual([attic.cost, attic.capital, attic.warranty, attic.category, attic.files.length, attic.tbd], [1000, true, "2036-02-04", "roof & attic", 2, false]);
+  assert.strictEqual(r.history["h-tbd-waterproofing-2"].tbd, true);
+  assert.strictEqual(get({ token: props.TOKEN }).history, undefined, "only with binder=1");
+
+  const paid = Object.assign({}, r.history["h-tbd-waterproofing-2"], { date: "2026-11-12", u: "2099-01-01T00:00:00.000Z" });
+  const stale = Object.assign({}, attic, { item: "old", u: "2000-01-01T00:00:00.000Z" });
+  const res = post({ token: props.TOKEN, history: {
+    "h-tbd-waterproofing-2": paid, "h-2026-02-03-attic": stale,
+    "h-2026-11-12-mower": { date: "2026-11-12", cost: 249, item: "Mower", from: "Home Depot", category: "appliances", files: [{ t: "r.jpg", u: "https://d/r" }], u: "2099-01-01T00:00:00.000Z" },
+    "h-2025-05-14-moving": { del: true, u: "2099-01-01T00:00:00.000Z" },
+    "h-bad": { item: "x", category: "spaceships" },
+  } });
+  assert.deepStrictEqual(res.historyResult, { added: ["h-2026-11-12-mower"], updated: ["h-tbd-waterproofing-2"], deleted: ["h-2025-05-14-moving"], stale: ["h-2026-02-03-attic"], invalid: ["h-bad"] });
+  assert.strictEqual(res.history["h-tbd-waterproofing-2"].date, "2026-11-12");
+  assert.strictEqual(res.history["h-2026-02-03-attic"].item, "Attic deposit");
+  assert.deepStrictEqual(res.history["h-2026-11-12-mower"].files, [{ t: "r.jpg", u: "https://d/r" }]);
+  assert.strictEqual(res.history["h-2026-02-03-attic"].files.length, 2, "rich text follows its row after the delete shifts rows");
+  assert.strictEqual(res.history["h-2025-05-14-moving"], undefined);
+
+  // A row typed by hand in the Sheet gets an id written back.
+  const tab = otherBooks.hc.tabs[1];
+  tab.rows.push([new Date(2026, 10, 1), 50, "Caulk", "Household", "Ace", "", "", "", "", "", "", ""]);
+  const again = get({ token: props.TOKEN, binder: "1" });
+  assert.ok(again.history["h-2026-11-01-caulk"]);
+  assert.strictEqual(tab.rows[tab.rows.length - 1][10], "h-2026-11-01-caulk");
+
+  props.HISTORY_GID = "0";
+  assert.match(get({ token: props.TOKEN, binder: "1" }).historyError, /refused tab/);
+  props.HISTORY_GID = "869386941";
+  assert.deepStrictEqual(otherBooks.hc.tabs[0].rows[1], ["$1", "wire: secret"], "purchase tab untouched");
+});
+
+test("docs + inventory sync like bills: newest u wins, bad kinds and dates refused, files/policy round-trip", () => {
+  reset();
+  const res = post({ token: props.TOKEN, docs: {
+    "d-carrier": { title: "Carrier parts warranty", kind: "warranty", date: "2024-07-18", expires: "2029-07-18", equipment: "A/C condenser",
+                   files: [{ t: "carrier.pdf", u: "https://d/c" }, { t: "x", u: "javascript:alert(1)" }], u: "2026-11-12T00:00:00.000Z" },
+    "d-ho": { title: "USAA homeowners", kind: "policy", expires: "2027-05-07", policy: { dwelling: 400000, ho208: "$10,000", bad: { x: 1 } }, u: "2026-11-12T00:00:00.000Z" },
+    "d-x": { title: "x", kind: "spaceship" }, "d-y": { title: "y", expires: "May 7" },
+  }, inventory: { "i-bike": { item: "Bike", room: "Garage", cost: "1,200", date: "2025-06-01", u: "2026-11-12T00:00:00.000Z" } } });
+  assert.deepStrictEqual(Object.keys(res.docs).sort(), ["d-carrier", "d-ho"]);
+  assert.deepStrictEqual(res.docs["d-carrier"].files, [{ t: "carrier.pdf", u: "https://d/c" }]);
+  assert.deepStrictEqual(res.docs["d-ho"].policy, { dwelling: 400000, ho208: "$10,000" });
+  assert.strictEqual(res.inventory["i-bike"].cost, 1200);
+  const back = get({ token: props.TOKEN });
+  assert.deepStrictEqual(back.docs, res.docs, "round-trips through the Sheet");
+  assert.deepStrictEqual(back.inventory, res.inventory);
+  // Typed by hand: a bare URL in files, no id.
+  tabs.docs.rows.push(["", "Survey", "legal", "2025-04-01", "", "", "https://d/s", "", "", "", ""]);
+  const typed = get({ token: props.TOKEN }).docs;
+  assert.deepStrictEqual(typed["d-survey"].files, [{ t: "file", u: "https://d/s" }]);
+});
+
+test("binder files: list under BINDER_ROOT only, upload into a year or Warranties folder with unique names", () => {
+  reset();
+  props.BINDER_ROOT = "Binder";
+  driveRoot.folders.push({ name: "Binder", folders: [{ name: "2026", folders: [], files: [{ name: "a.pdf", bytes: [1], mimeType: "application/pdf" }] }],
+                           files: [{ name: "house costs", bytes: [], mimeType: "application/vnd.google-apps.spreadsheet" }, { name: "loose.pdf", bytes: [1], mimeType: "application/pdf" }] });
+  const top = get({ token: props.TOKEN, op: "files" });
+  assert.deepStrictEqual([top.folders, top.files.map((f) => f.name)], [["2026"], ["loose.pdf"]], "ledgers are not listed");
+  assert.deepStrictEqual(get({ token: props.TOKEN, op: "files", folder: "2026" }).files.map((f) => f.name), ["a.pdf"]);
+  assert.strictEqual(get({ token: props.TOKEN, op: "files", folder: "../x" }).ok, false);
+  assert.strictEqual(get({ token: "nope", op: "files" }).error, "unauthorized");
+
+  const b64 = Buffer.from("pdfbytes").toString("base64");
+  const up = post({ token: props.TOKEN, op: "upload", folder: "Warranties", name: "2026-11-12 Carrier: warranty.pdf", mimeType: "application/pdf", data: b64 });
+  assert.deepStrictEqual([up.ok, up.name, up.size], [true, "2026-11-12 Carrier warranty.pdf", 8]);
+  const up2 = post({ token: props.TOKEN, op: "upload", folder: "Warranties", name: "2026-11-12 Carrier: warranty.pdf", mimeType: "application/pdf", data: b64 });
+  assert.strictEqual(up2.name, "2026-11-12 Carrier warranty (2).pdf");
+  assert.strictEqual(driveRoot.folders[0].folders.find((f) => f.name === "Warranties").files.length, 2);
+  assert.strictEqual(post({ token: props.TOKEN, op: "upload", folder: "Initial Paperwork", name: "x", mimeType: "application/pdf", data: b64 }).ok, false);
+  assert.strictEqual(post({ token: props.TOKEN, op: "upload", folder: "2026", name: "x", mimeType: "text/html", data: b64 }).ok, false);
+  assert.strictEqual(post({ token: "nope", op: "upload", folder: "2026", name: "x", mimeType: "application/pdf", data: b64 }).error, "unauthorized");
+  assert.strictEqual(post({ admin: props.ADMIN_TOKEN, op: "upload", folder: "2026", name: "x", mimeType: "application/pdf", data: b64 }).error, "unauthorized", "upload is a page op");
 });
 
 console.log(passed + " passed" + (process.exitCode ? ", with failures" : ""));

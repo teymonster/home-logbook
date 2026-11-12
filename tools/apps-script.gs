@@ -1,5 +1,5 @@
 /**
- * Home Logbook — Google Apps Script web app (v13).
+ * Home Logbook — Google Apps Script web app (v15).
  *
  * Bound to the "Home Logbook progress" Sheet. Tabs, created on first use:
  *   log          id | last | history | updated | deleted                    (task tick-offs)
@@ -14,6 +14,14 @@
  *   receipts     id | kind | date | merchant | total | orderId | categories | items | last4 |
  *                gmailId | txId | updated | deleted                       (budget: parsed emails)
  *   budget       category | target | note | updated | deleted             (budget: monthly targets)
+ *   docs         id | title | kind | date | expires | equipment | files | notes | policy | updated | deleted
+ *                (binder documents & warranties; files = JSON [{t,u}] Drive links; policy = JSON coverage fields)
+ *   inventory    id | item | room | cost | date | files | notes | updated | deleted   (binder: high-value items)
+ *
+ * Binder History (v15) lives in ANOTHER spreadsheet: one tab of the owner's house-costs ledger, named by the
+ * script properties HISTORY_ID + HISTORY_GID (set by the admin op binderprep, never hard-coded here). The
+ * page token can read and edit that one tab and nothing else in that spreadsheet. BINDER_ROOT is the Drive
+ * folder (path from My Drive) whose subfolders the page may list and upload into; it is also a property.
  *
  * The three budget tabs are not part of the app's normal sync: GET returns them only with
  * &budget=1 and POST merges them only when present. Columns listed in a collection's "owned"
@@ -36,7 +44,7 @@
  * typo in the Sheet can never cause rows to be dropped.
  */
 
-var VERSION = 14;
+var VERSION = 15;
 var CADENCES = ["weekly", "monthly", "bimonthly", "quarterly", "semiannual", "annual"];
 var SCAN_DAYS = 40;             // default look-back for the daily / on-demand scan
 var SCAN_MIN_GAP_MS = 5 * 60 * 1000;
@@ -71,9 +79,17 @@ var COLLECTIONS = {
     header: ["category", "target", "note", "updated", "deleted"],
     fromRow: budgetFromRow, toRow: budgetToRow, normalize: normalizeBudget,
     owned: ["target", "note"], setup: setupBudgetTab
+  },
+  docs: {
+    header: ["id", "title", "kind", "date", "expires", "equipment", "files", "notes", "policy", "updated", "deleted"],
+    fromRow: docFromRow, toRow: docToRow, normalize: normalizeDoc
+  },
+  inventory: {
+    header: ["id", "item", "room", "cost", "date", "files", "notes", "updated", "deleted"],
+    fromRow: invFromRow, toRow: invToRow, normalize: normalizeInv
   }
 };
-var NAMES = ["log", "bills", "payments"];                 // the app's sync set (unchanged)
+var NAMES = ["log", "bills", "payments", "docs", "inventory"]; // the app's sync set; a client writes only what it sends
 var BUDGET_NAMES = ["transactions", "receipts", "budget"]; // read with &budget=1, written when sent
 var TAGS = ["necessary", "unnecessary", "frivolous", "skip"];
 var ACCOUNTS = ["chase", "usaa"];
@@ -99,6 +115,7 @@ function doGet(e) {
       if (p.op === "drivels") return out(driveList(String(p.folder || "")));
       if (p.op === "drivefind") return out(driveFind(String(p.name || ""), clampInt(p.max, 1, 200, 50)));
       if (p.op === "sheetinfo") return out(sheetInfo(String(p.id || "")));
+      if (p.op === "binderprep") return out(binderPrepReport(String(p.id || ""), { gid: p.gid }));
       if (p.op === "sheetget") return out(sheetGet(String(p.id || ""), { gid: p.gid, tab: p.tab }, clampInt(p.max, 1, 2000, 500)));
       if (p.op === "budgetscan") return out(scanBudget({ kind: s(p.kind) || "all", dry: p.dry === "1", after: gmailDate(p.after), before: gmailDate(p.before),
                                                          days: p.days ? clampInt(p.days, 1, 400, SCAN_DAYS) : null, max: clampInt(p.max, 10, 300, 300) }));
@@ -108,8 +125,14 @@ function doGet(e) {
     }
   }
   if (!authorized(p.token)) return out({ ok: false, error: "unauthorized" });
+  if (p.op === "files") {
+    try { return out(binderFiles(String(p.folder || ""))); } catch (err) { return out({ ok: false, error: String(err) }); }
+  }
   var resp = { ok: true, version: VERSION, lastScan: getProp("LAST_SCAN") || "" };
   for (var i = 0; i < NAMES.length; i++) resp[NAMES[i]] = readAll(NAMES[i]);
+  if (p.binder === "1") {
+    try { resp.history = readHistory().rows; } catch (err) { resp.historyError = String(err); }
+  }
   if (p.budget === "1") {
     resp.lastBudgetScan = getProp("LAST_BUDGET_SCAN") || "";
     for (var j = 0; j < BUDGET_NAMES.length; j++) resp[BUDGET_NAMES[j]] = readAll(BUDGET_NAMES[j]);
@@ -120,11 +143,17 @@ function doGet(e) {
 function doPost(e) {
   var body;
   try { body = JSON.parse(e.postData.contents); } catch (err) { return out({ ok: false, error: "bad json" }); }
+  if (body.op === "upload") {
+    // Page op: save one photo/PDF into a subfolder of BINDER_ROOT. Needs the app token.
+    if (!authorized(body.token)) return out({ ok: false, error: "unauthorized" });
+    try { return out(binderUpload(body)); } catch (err) { return out({ ok: false, error: String(err) }); }
+  }
   if (body.op !== undefined) {
     // Owner-only POST operations (writes to another spreadsheet). Never consult the app token here.
     if (!adminAuthorized(body.admin)) return out({ ok: false, error: "unauthorized" });
     try {
       if (body.op === "sheetput") return out(sheetPut(String(body.id || ""), { gid: body.gid, tab: body.tab }, body));
+      if (body.op === "binderprep") return out(binderPrep(body));
       return out({ ok: false, error: "unknown op" });
     } catch (err) {
       return out({ ok: false, error: String(err) });
@@ -153,9 +182,7 @@ function doPost(e) {
       }
     }
     var merged = {};
-    merged.log = merge("log", current.log, body.log || {});
-    merged.bills = merge("bills", current.bills, body.bills || {});
-    merged.payments = merge("payments", current.payments, body.payments || {});
+    for (i = 0; i < NAMES.length; i++) merged[NAMES[i]] = merge(NAMES[i], current[NAMES[i]], body[NAMES[i]] || {});
     // Write only the collections the client sent, so an older app never rewrites the others.
     for (i = 0; i < NAMES.length; i++) {
       name = NAMES[i];
@@ -175,6 +202,13 @@ function doPost(e) {
       resp[name] = body.quiet ? { rows: Object.keys(m).length } : m;
     }
     if (scanInfo) resp.scan = scanInfo;
+    // Binder History: rows the client changed (never the whole tab), applied by id with newest-u-wins.
+    if (body.history && typeof body.history === "object") {
+      try { var hr = writeHistory(body.history); resp.history = hr.rows; resp.historyResult = hr.result; }
+      catch (err) { resp.historyError = String(err); }
+    } else if (body.binder) {
+      try { resp.history = readHistory().rows; } catch (err) { resp.historyError = String(err); }
+    }
     return out(resp);
   } finally {
     lock.releaseLock();
@@ -992,6 +1026,378 @@ function sheetPut(id, which, body) {
     sh.getRange(top + x.r, left + x.c).setRichTextValue(b.build());
   });
   return { ok: true, id: id, tab: sh.getName(), gid: sh.getSheetId(), top: top, left: left, rows: plain.length, cols: ncols, richCells: rich.length };
+}
+
+/* ------------------------------------------------------------------ binder: docs + inventory */
+
+var DOC_KINDS = ["legal", "report", "warranty", "policy", "contract", "manual", "receipt", "other"];
+
+// files cell: JSON [{t,u}] as the app writes it, or (typed by hand) one or more URLs separated by spaces/newlines.
+function filesFromCell(x) {
+  var str = s(x);
+  if (!str) return [];
+  if (str.charAt(0) === "[") {
+    try {
+      var arr = JSON.parse(str);
+      if (Array.isArray(arr)) return normalizeFiles(arr);
+    } catch (e) { /* fall through to URLs */ }
+  }
+  return str.split(/\s+/).filter(function (u) { return /^https:\/\//.test(u); }).map(function (u) { return { t: "file", u: u }; });
+}
+function normalizeFiles(arr) {
+  if (!Array.isArray(arr)) return [];
+  return arr.filter(function (f) { return f && /^https:\/\//.test(s(f.u)); })
+    .map(function (f) { return { t: s(f.t).slice(0, 120) || "file", u: s(f.u) }; }).slice(0, 20);
+}
+function filesToCell(files) { return files && files.length ? JSON.stringify(files) : ""; }
+
+function jsonObj(x) {
+  if (x && typeof x === "object" && !Array.isArray(x)) return x;
+  var str = s(x);
+  if (!str) return null;
+  try { var o = JSON.parse(str); return o && typeof o === "object" && !Array.isArray(o) ? o : null; } catch (e) { return null; }
+}
+// Policy fields are short strings/numbers only; anything else is dropped.
+function normalizePolicy(o) {
+  o = jsonObj(o);
+  if (!o) return null;
+  var outp = {}, n = 0;
+  Object.keys(o).forEach(function (k) {
+    var v = o[k];
+    if (n >= 30 || !/^[a-zA-Z][a-zA-Z0-9]{0,30}$/.test(k)) return;
+    if (typeof v === "number" && isFinite(v)) { outp[k] = v; n++; }
+    else if (typeof v === "string" && v.trim()) { outp[k] = v.trim().slice(0, 300); n++; }
+  });
+  return n ? outp : null;
+}
+
+function docFromRow(r, ctx) {
+  var id = s(r[0]), title = s(r[1]);
+  if (!id && !title) return null;
+  if (!id) id = "d-" + uniqueSlug(title, ctx.ids);
+  var updated = isoOf(r[9]) || ctx.now;
+  if (s(r[10]).toUpperCase() === "TRUE") return [id, { del: true, u: updated }];
+  var v = normalizeDoc({ title: title, kind: s(r[2]), date: dateStr(r[3]), expires: dateStr(r[4]), equipment: s(r[5]),
+                         files: filesFromCell(r[6]), notes: s(r[7]), policy: jsonObj(r[8]), u: updated });
+  if (!v) { ctx.unreadable.push(id); return null; }
+  return [id, v];
+}
+function docToRow(id, v) {
+  if (v.del) return [id, "", "", "", "", "", "", "", "", v.u || "", "TRUE"];
+  return [id, v.title, v.kind, v.date || "", v.expires || "", v.equipment || "", filesToCell(v.files), v.notes || "",
+          v.policy ? JSON.stringify(v.policy) : "", v.u || "", ""];
+}
+function normalizeDoc(v) {
+  if (!v || typeof v !== "object") return null;
+  var now = new Date().toISOString();
+  if (v.del) return { del: true, u: isoOf(v.u) || now };
+  var title = s(v.title);
+  if (!title) return null;
+  var kind = s(v.kind).toLowerCase() || "other";
+  if (DOC_KINDS.indexOf(kind) < 0) return null;
+  var date = s(v.date), expires = s(v.expires);
+  if (date && !isDate(date)) return null;
+  if (expires && !isDate(expires)) return null;
+  var outd = { title: title.slice(0, 200), kind: kind, date: date, expires: expires, equipment: s(v.equipment).slice(0, 60),
+               files: normalizeFiles(v.files), notes: s(v.notes).slice(0, 2000), u: isoOf(v.u) || now };
+  var pol = normalizePolicy(v.policy);
+  if (pol) outd.policy = pol;
+  return outd;
+}
+
+function invFromRow(r, ctx) {
+  var id = s(r[0]), item = s(r[1]);
+  if (!id && !item) return null;
+  if (!id) id = "i-" + uniqueSlug(item, ctx.ids);
+  var updated = isoOf(r[7]) || ctx.now;
+  if (s(r[8]).toUpperCase() === "TRUE") return [id, { del: true, u: updated }];
+  var v = normalizeInv({ item: item, room: s(r[2]), cost: r[3], date: dateStr(r[4]), files: filesFromCell(r[5]), notes: s(r[6]), u: updated });
+  if (!v) { ctx.unreadable.push(id); return null; }
+  return [id, v];
+}
+function invToRow(id, v) {
+  if (v.del) return [id, "", "", "", "", "", "", v.u || "", "TRUE"];
+  return [id, v.item, v.room || "", numStr(v.cost), v.date || "", filesToCell(v.files), v.notes || "", v.u || "", ""];
+}
+function normalizeInv(v) {
+  if (!v || typeof v !== "object") return null;
+  var now = new Date().toISOString();
+  if (v.del) return { del: true, u: isoOf(v.u) || now };
+  var item = s(v.item);
+  if (!item) return null;
+  var date = s(v.date);
+  if (date && !isDate(date)) return null;
+  return { item: item.slice(0, 200), room: s(v.room).slice(0, 60), cost: toNum(v.cost), date: date,
+           files: normalizeFiles(v.files), notes: s(v.notes).slice(0, 2000), u: isoOf(v.u) || now };
+}
+
+/* ------------------------------------------------------------------ binder: history (house-costs tab) */
+
+// Layout after binderprep: row 1 totals, row 2 this header, data from row 3. Columns K:L are hidden.
+var HIST_HEADER = ["Date", "Cost", "Item", "Whose?", "From", "Notes", "Category", "Capital", "Warranty until", "Files", "id", "updated"];
+var HIST_ORIGINAL = ["Date", "Cost", "Item", "Whose?", "From", "Notes"];
+var HIST_COLS = HIST_HEADER.length, HIST_FIRST = 3;
+var HIST_CATEGORIES = ["heating & A/C", "plumbing & sewer", "exterior & masonry", "roof & attic", "electrical", "pest",
+                       "appliances", "moving & closing", "other"];
+// Tabs of the house-costs ledger the binder must never configure or touch: the purchase tab holds
+// wire instructions, and the store-receipts tab is not house work.
+var HIST_DENY_GIDS = [0, 513924073];
+
+function historyTab() {
+  var id = getProp("HISTORY_ID"), gid = getProp("HISTORY_GID");
+  if (!id || gid == null || gid === "") throw new Error("history not configured (run binderprep)");
+  if (HIST_DENY_GIDS.indexOf(Number(gid)) >= 0) throw new Error("refused tab");
+  var t = otherTab(id, { gid: gid });
+  var head = t.sh.getRange(2, 1, 1, HIST_COLS).getValues()[0].map(s);
+  if (head.join("|") !== HIST_HEADER.join("|")) throw new Error("history tab is not in the binder layout");
+  t.tz = t.ss.getSpreadsheetTimeZone();
+  return t;
+}
+
+function cellDate(x, zone) {
+  if (isDateObj(x)) return Utilities.formatDate(x, zone, "yyyy-MM-dd");
+  var str = s(x);
+  if (isDate(str)) return str;
+  var m = /^(\d{1,2})\/(\d{1,2})\/(\d{4})$/.exec(str);
+  return m ? m[3] + "-" + pad2(Number(m[1])) + "-" + pad2(Number(m[2])) : "";
+}
+function richRuns(rt) {
+  if (!rt || typeof rt.getRuns !== "function") return [];
+  var files = [];
+  rt.getRuns().forEach(function (run) {
+    var u = run.getLinkUrl(), t = run.getText();
+    if (u && /^https:\/\//.test(u)) files.push({ t: s(t) || "file", u: u });
+  });
+  return files;
+}
+
+// Every data row, keyed by id. Rows typed by hand in the Sheet without an id get one written back.
+function readHistory(t) {
+  t = t || historyTab();
+  var sh = t.sh, last = sh.getLastRow(), rows = {}, order = [], missing = [];
+  if (last < HIST_FIRST) return { rows: rows, order: order, t: t };
+  var n = last - HIST_FIRST + 1;
+  var vals = sh.getRange(HIST_FIRST, 1, n, HIST_COLS).getValues();
+  var rich = sh.getRange(HIST_FIRST, 10, n, 1).getRichTextValues();
+  var taken = {};
+  vals.forEach(function (r) { if (s(r[10])) taken[s(r[10])] = true; });
+  vals.forEach(function (r, i) {
+    var item = s(r[2]);
+    if (!item && !s(r[1]) && !s(r[0])) return;      // blank row
+    var id = s(r[10]);
+    var date = cellDate(r[0], t.tz);
+    if (!id) {
+      id = "h-" + (date || "tbd") + "-" + slug(item).slice(0, 20);
+      var base = id, k = 2;
+      while (taken[id]) { id = base + "-" + k; k++; }
+      taken[id] = true;
+      missing.push({ row: HIST_FIRST + i, id: id });
+    }
+    rows[id] = {
+      row: HIST_FIRST + i, date: date, tbd: !date, cost: toNum(r[1]), item: item, whose: s(r[3]), from: s(r[4]),
+      notes: s(r[5]), category: s(r[6]), capital: toBool(r[7]), warranty: cellDate(r[8], t.tz),
+      files: richRuns(rich[i] && rich[i][0]), u: isoOf(r[11])
+    };
+    order.push(id);
+  });
+  missing.forEach(function (m) { sh.getRange(m.row, 11, 1, 1).setValues([[m.id]]); });
+  return { rows: rows, order: order, t: t };
+}
+
+function normalizeHistory(v) {
+  if (!v || typeof v !== "object") return null;
+  var now = new Date().toISOString();
+  if (v.del) return { del: true, u: isoOf(v.u) || now };
+  var item = s(v.item);
+  if (!item) return null;
+  var date = s(v.date);
+  if (date && !isDate(date)) return null;
+  var warranty = s(v.warranty);
+  if (warranty && !isDate(warranty)) return null;
+  var cat = s(v.category);
+  if (cat && HIST_CATEGORIES.indexOf(cat) < 0) return null;
+  return { date: date, cost: toNum(v.cost), item: item.slice(0, 500), whose: s(v.whose) || "Household", from: s(v.from).slice(0, 120),
+           notes: s(v.notes).slice(0, 2000), category: cat, capital: v.capital === true, warranty: warranty,
+           files: normalizeFiles(v.files), u: isoOf(v.u) || now };
+}
+
+function historyCells(id, v, zone) {
+  var d = function (x) { return x ? Utilities.parseDate(x, zone, "yyyy-MM-dd") : ""; };
+  return [v.date ? d(v.date) : "tbd", v.cost == null ? "" : v.cost, v.item, v.whose, v.from, v.notes, v.category,
+          v.capital ? true : "", d(v.warranty), (v.files || []).map(function (f) { return f.t; }).join(" · "), id, v.u];
+}
+function setFilesCell(sh, row, files) {
+  var text = "", b, pos = 0;
+  (files || []).forEach(function (f, i) { text += (i ? " · " : "") + f.t; });
+  b = SpreadsheetApp.newRichTextValue().setText(text);
+  (files || []).forEach(function (f, i) {
+    if (i) pos += 3;
+    b.setLinkUrl(pos, pos + f.t.length, f.u);
+    pos += f.t.length;
+  });
+  sh.getRange(row, 10).setRichTextValue(b.build());
+}
+
+// incoming: {id: row|{del:true,u}}. A change older than (or as old as) the Sheet row's updated stamp is
+// refused and reported, so a stale phone never overwrites an edit made in the Sheet or on another device.
+function writeHistory(incoming) {
+  var cur = readHistory(), t = cur.t, sh = t.sh;
+  var result = { added: [], updated: [], deleted: [], stale: [], invalid: [] };
+  var deletes = [];
+  Object.keys(incoming).forEach(function (id) {
+    if (!/^[a-z0-9][a-z0-9-]{0,80}$/.test(id)) { result.invalid.push(id); return; }
+    var v = normalizeHistory(incoming[id]);
+    if (!v) { result.invalid.push(id); return; }
+    var have = cur.rows[id];
+    if (have && have.u && v.u <= have.u) { result.stale.push(id); return; }
+    if (v.del) { if (have) { deletes.push(have.row); result.deleted.push(id); } return; }
+    var row = have ? have.row : Math.max(sh.getLastRow() + 1, HIST_FIRST);
+    var range = sh.getRange(row, 1, 1, HIST_COLS);
+    range.setValues([historyCells(id, v, t.tz)]);
+    setFilesCell(sh, row, v.files);
+    if (!have) { sh.getRange(row, 1, 1, 1).setNumberFormat("m/d/yyyy"); sh.getRange(row, 2, 1, 1).setNumberFormat("$#,##0.00"); }
+    (have ? result.updated : result.added).push(id);
+  });
+  deletes.sort(function (a, b) { return b - a; }).forEach(function (r) { sh.deleteRow(r); });
+  return { rows: readHistory(t).rows, result: result };
+}
+
+/* ------------------------------------------------------------------ binder: one-time ledger restructure (admin) */
+
+// op=binderprep&id=&gid= — read-only: the tab as it is now, with any link runs in the Notes column, so the
+// owner's machine can build the plan for the POST.
+function binderPrepReport(id, which) {
+  if (HIST_DENY_GIDS.indexOf(Number(which.gid)) >= 0) return { ok: false, error: "refused tab" };
+  var t = otherTab(id, which), sh = t.sh, last = sh.getLastRow(), cols = Math.max(sh.getLastColumn(), 6);
+  var display = last ? sh.getRange(1, 1, last, cols).getDisplayValues() : [];
+  var rich = last ? sh.getRange(1, 6, last, 1).getRichTextValues() : [];
+  return { ok: true, tab: sh.getName(), gid: sh.getSheetId(), tz: t.ss.getSpreadsheetTimeZone(), rows: last, cols: cols,
+           prepared: last >= 2 && sh.getRange(2, 1, 1, HIST_COLS).getValues()[0].map(s).join("|") === HIST_HEADER.join("|"),
+           values: display, notesLinks: rich.map(function (r, i) { return { row: i + 1, links: richRuns(r[0]) }; }).filter(function (x) { return x.links.length; }),
+           configured: { id: getProp("HISTORY_ID") || "", gid: getProp("HISTORY_GID") || "", root: getProp("BINDER_ROOT") || "" } };
+}
+
+// POST {admin, op:"binderprep", id, gid, root, dry, rows:[{row, item, id, date, category, capital, warranty, files, notes}]}
+// The plan must name every data row of the original layout (rows 2..last) by its row number and item text,
+// or nothing is written. Without dry: copies the tab to "<name> (backup YYYY-MM-DD)", rewrites it in the
+// binder layout (totals row 1, header row 2, data row 3+, ids and stamps in hidden K:L), and records
+// HISTORY_ID / HISTORY_GID / BINDER_ROOT.
+function binderPrep(body) {
+  var id = s(body.id), gid = body.gid;
+  if (!id || gid == null || gid === "") return { ok: false, error: "id and gid required" };
+  if (HIST_DENY_GIDS.indexOf(Number(gid)) >= 0) return { ok: false, error: "refused tab" };
+  var root = s(body.root);
+  if (!root || /(^|\/)\.\.(\/|$)/.test(root)) return { ok: false, error: "root required" };
+  var t = otherTab(id, { gid: gid }), sh = t.sh, zone = t.ss.getSpreadsheetTimeZone();
+  var last = sh.getLastRow(), cols = Math.max(sh.getLastColumn(), HIST_COLS);
+  var grid = sh.getRange(1, 1, last, cols).getValues(), shown = sh.getRange(1, 1, last, cols).getDisplayValues();
+  if (grid[0].slice(0, 6).map(s).join("|") !== HIST_ORIGINAL.join("|")) return { ok: false, error: "tab is not in the original layout (already prepared?)" };
+  var plan = Array.isArray(body.rows) ? body.rows : [], byRow = {}, errors = [];
+  plan.forEach(function (p) { byRow[Number(p.row)] = p; });
+  var dataRows = [];
+  for (var r = 2; r <= last; r++) {
+    var g = grid[r - 1];
+    if (!s(g[0]) && !s(g[1]) && !s(g[2])) continue;
+    var p = byRow[r];
+    if (!p) { errors.push("row " + r + " missing from plan"); continue; }
+    if (s(p.item) !== s(g[2])) { errors.push("row " + r + " item does not match"); continue; }
+    var v = normalizeHistory({ date: p.date === "tbd" ? "" : p.date, cost: shown[r - 1][1], item: s(g[2]), whose: s(g[3]), from: s(g[4]),
+                               notes: p.notes != null ? p.notes : s(g[5]), category: p.category, capital: p.capital === true,
+                               warranty: p.warranty, files: p.files });
+    if (!v || !/^h-[a-z0-9-]{1,80}$/.test(s(p.id))) { errors.push("row " + r + " invalid plan entry"); continue; }
+    if (p.date === "tbd" && s(g[0]).toLowerCase() !== "tbd") errors.push("row " + r + " is dated in the sheet, not tbd");
+    if (p.date !== "tbd" && cellDate(g[0], zone) !== v.date) errors.push("row " + r + " date " + v.date + " does not match the sheet's " + cellDate(g[0], zone));
+    dataRows.push({ from: r, id: s(p.id), v: v });
+  }
+  Object.keys(byRow).forEach(function (k) { if (Number(k) < 2 || Number(k) > last) errors.push("plan row " + k + " is outside the data"); });
+  var ids = {};
+  dataRows.forEach(function (d) { if (ids[d.id]) errors.push("duplicate id " + d.id); ids[d.id] = true; });
+  if (errors.length) return { ok: false, error: "plan rejected", problems: errors };
+
+  var now = new Date().toISOString();
+  var after = dataRows.map(function (d) { d.v.u = now; return historyCells(d.id, d.v, zone); });
+  var preview = { totals: ["Paid", "=SUMIF(A3:A,\">0\",B3:B)", "=\"Committed (tbd): \"&TEXT(SUMIF(A3:A,\"tbd\",B3:B),\"$#,##0.00\")"],
+                  header: HIST_HEADER,
+                  rows: dataRows.map(function (d, i) { return { from: d.from, to: HIST_FIRST + i, before: shown[d.from - 1].slice(0, 9),
+                                                               after: after[i].map(function (c) { return isDateObj(c) ? Utilities.formatDate(c, zone, "yyyy-MM-dd") : c; }),
+                                                               files: d.v.files }; }) };
+  if (body.dry !== false) return { ok: true, dry: true, tab: sh.getName(), backup: sh.getName() + " (backup " + Utilities.formatDate(new Date(), zone, "yyyy-MM-dd") + ")", preview: preview };
+
+  var lock = LockService.getScriptLock();
+  lock.waitLock(10000);
+  try {
+    var backupName = sh.getName() + " (backup " + Utilities.formatDate(new Date(), zone, "yyyy-MM-dd") + ")";
+    if (t.ss.getSheetByName(backupName)) return { ok: false, error: "backup tab already exists: " + backupName };
+    sh.copyTo(t.ss).setName(backupName);
+    sh.getRange(1, 1, last, cols).clear();
+    sh.getRange(1, 1, 1, 3).setValues([preview.totals]);
+    sh.getRange(2, 1, 1, HIST_COLS).setValues([HIST_HEADER]).setFontWeight("bold");
+    if (after.length) {
+      sh.getRange(HIST_FIRST, 1, after.length, HIST_COLS).setValues(after);
+      sh.getRange(HIST_FIRST, 1, after.length, 1).setNumberFormat("m/d/yyyy");
+      sh.getRange(HIST_FIRST, 2, after.length, 1).setNumberFormat("$#,##0.00");
+      sh.getRange(HIST_FIRST, 9, after.length, 1).setNumberFormat("m/d/yyyy");
+      dataRows.forEach(function (d, i) { setFilesCell(sh, HIST_FIRST + i, d.v.files); });
+    }
+    sh.getRange(1, 2, 1, 1).setNumberFormat("$#,##0.00");
+    sh.setFrozenRows(2);
+    sh.hideColumns(11, 2);
+    setProp("HISTORY_ID", id);
+    setProp("HISTORY_GID", String(sh.getSheetId()));
+    setProp("BINDER_ROOT", root);
+  } finally { lock.releaseLock(); }
+  return { ok: true, dry: false, tab: sh.getName(), backup: backupName, rows: after.length };
+}
+
+/* ------------------------------------------------------------------ binder: Drive (page token) */
+
+var UPLOAD_MAX = 20 * 1024 * 1024;
+var UPLOAD_TYPES = { "image/jpeg": "jpg", "image/png": "png", "image/heic": "heic", "application/pdf": "pdf" };
+var UPLOAD_FOLDER_RE = /^(\d{4}|Warranties)$/;
+
+function binderRoot() {
+  var root = getProp("BINDER_ROOT");
+  if (!root) throw new Error("binder folder not configured (run binderprep)");
+  var f = driveFolderLookup(root);
+  if (!f) throw new Error("binder folder missing");
+  return f;
+}
+// One level below BINDER_ROOT only: "" lists the root's folders (and its loose files), "2026" lists that folder.
+function binderFiles(sub) {
+  sub = s(sub);
+  if (sub && !/^[^\/\\]{1,60}$/.test(sub)) return { ok: false, error: "bad folder" };
+  var root = binderRoot(), folder = root;
+  if (sub) {
+    var it = root.getFoldersByName(sub);
+    if (!it.hasNext()) return { ok: true, folder: sub, folders: [], files: [] };
+    folder = it.next();
+  }
+  var res = { ok: true, folder: sub, folders: [], files: [] };
+  if (!sub) { var fs = root.getFolders(); while (fs.hasNext()) res.folders.push(fs.next().getName()); res.folders.sort(); }
+  var files = folder.getFiles();
+  while (files.hasNext()) {
+    var f = files.next(), mt = f.getMimeType();
+    if (/^application\/vnd\.google-apps\.spreadsheet/.test(mt)) continue;   // the ledgers themselves are not documents
+    res.files.push({ name: f.getName(), url: f.getUrl(), size: f.getSize(), created: Utilities.formatDate(f.getDateCreated(), "UTC", "yyyy-MM-dd") });
+  }
+  res.files.sort(function (a, b) { return a.created < b.created ? 1 : a.created > b.created ? -1 : a.name < b.name ? -1 : 1; });
+  return res;
+}
+// POST {token, op:"upload", folder:"2026"|"Warranties", name, mimeType, data:<base64>}
+function binderUpload(body) {
+  var sub = s(body.folder), mt = s(body.mimeType).toLowerCase(), ext = UPLOAD_TYPES[mt];
+  if (!UPLOAD_FOLDER_RE.test(sub)) return { ok: false, error: "folder must be a year or Warranties" };
+  if (!ext) return { ok: false, error: "only JPEG, PNG, HEIC or PDF" };
+  var data = s(body.data);
+  if (!data || data.length > Math.ceil(UPLOAD_MAX / 3) * 4 + 8) return { ok: false, error: "file missing or over 20 MB" };
+  var bytes = Utilities.base64Decode(data);
+  if (bytes.length > UPLOAD_MAX) return { ok: false, error: "over 20 MB" };
+  var base = s(body.name).replace(/\.[a-z0-9]{2,4}$/i, "").replace(/[\/\\:*?"<>|\u0000-\u001f]+/g, " ").replace(/\s+/g, " ").trim().slice(0, 100) || "upload";
+  var root = binderRoot(), it = root.getFoldersByName(sub), folder = it.hasNext() ? it.next() : root.createFolder(sub);
+  var name = base + "." + ext, k = 2;
+  while (folder.getFilesByName(name).hasNext()) { name = base + " (" + k + ")." + ext; k++; }
+  var file = folder.createFile(Utilities.newBlob(bytes, mt, name));
+  return { ok: true, folder: sub, name: name, url: file.getUrl(), size: bytes.length };
 }
 
 /* ------------------------------------------------------------------ gmail: scan */
