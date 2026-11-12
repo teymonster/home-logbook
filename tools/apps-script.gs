@@ -1457,7 +1457,8 @@ var LABEL_PROMPT = [
   "- room: only if a photo makes it obvious (a dryer in a laundry room); otherwise leave it empty.",
   "- notes: anything else worth keeping, in one short line (capacity, size, a manufacture date). Otherwise empty.",
   "",
-  "Leave a field as an empty string when the photos don't show it; an empty field is much better than a wrong one. List in unsure the fields you filled but can't read clearly."
+  "Leave a field as an empty string when the photos don't show it; an empty field is much better than a wrong one. List in unsure the fields you filled but can't read clearly.",
+  "Never describe the photos or explain what you couldn't read, in notes or anywhere else: if nothing about an item is readable, return every field empty."
 ].join("\n");
 
 function readLabel(body) {
