@@ -117,7 +117,8 @@ function fakeOtherSheet(t) {
         return { getRuns: () => (rt ? rt.links.map(([a, b, u]) => ({ getText: () => rt.text.slice(a, b), getLinkUrl: () => u })) : []) };
       })),
       clear: () => { for (let i = 0; i < nrows; i++) { const r = t.rows[row - 1 + i]; if (r) for (let j = 0; j < ncols; j++) r[col - 1 + j] = ""; for (let j = 0; j < ncols; j++) delete t.rich[(row + i) + ":" + (col + j)]; } },
-      setNumberFormat() { return this; }, setFontWeight() { return this; },
+      setNumberFormat() { if (t.tableCols && row > 1 && col <= t.tableCols) throw new Error("Exception: You can't set the number format of cells in a typed column."); return this; },
+      setFontWeight() { return this; },
     };
   }
   return {
@@ -506,7 +507,7 @@ test("binderprep: report, refused tabs, plan checks, dry run by default, then ba
   const tab = otherBooks.hc.tabs[1], backup = otherBooks.hc.tabs[3];
   assert.match(backup.name, /^New House Purchases \(backup \d{4}-\d{2}-\d{2}\)$/);
   assert.strictEqual(backup.rows[2][8], "=SUM(B:B)", "backup keeps the original cells");
-  assert.deepStrictEqual(wet.warnings, []);
+  assert.ok(wet.warnings.every((w) => /^formats: .*typed column/.test(w)), "only the Table's typed-column format refusal: " + wet.warnings);
   assert.deepStrictEqual(tab.rows[0].slice(0, 12), ["Date", "Cost", "Item", "Whose?", "From", "Notes", "Category", "Capital", "Warranty until", "Files", "id", "updated"]);
   assert.deepStrictEqual([tab.rows[0][13], tab.rows[1][13], tab.rows[1][14]], ["Paid", "Committed (tbd)", '=SUMIF(A2:A,"tbd",B2:B)'], "totals beside the table");
   assert.ok(tab.rows[2].slice(7, 9).every((x) => x !== "Total Spent:" && x !== "=SUM(B:B)"), "old total cell is gone");
@@ -543,6 +544,7 @@ test("history: page token reads the one tab, edits by id with newest-u-wins, app
     "h-2025-05-14-moving": { del: true, u: "2099-01-01T00:00:00.000Z" },
     "h-bad": { item: "x", category: "spaceships" },
   } });
+  assert.strictEqual(res.historyError, undefined, "appending into a Table's typed columns works");
   assert.deepStrictEqual(res.historyResult, { added: ["h-2026-11-12-mower"], updated: ["h-tbd-waterproofing-2"], deleted: ["h-2025-05-14-moving"], stale: ["h-2026-02-03-attic"], invalid: ["h-bad"] });
   assert.strictEqual(res.history["h-tbd-waterproofing-2"].date, "2026-11-12");
   assert.strictEqual(res.history["h-2026-02-03-attic"].item, "Attic deposit");

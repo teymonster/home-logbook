@@ -1257,7 +1257,9 @@ function writeHistory(incoming) {
     var range = sh.getRange(row, 1, 1, HIST_COLS);
     range.setValues([historyCells(id, v, t.tz)]);
     setFilesCell(sh, row, v.files);
-    if (!have) { sh.getRange(row, 1, 1, 1).setNumberFormat("m/d/yyyy"); sh.getRange(row, 2, 1, 1).setNumberFormat("$#,##0.00"); }
+    // Outside a Sheets Table a new row needs date/currency formats; inside one the typed columns refuse
+    // formats ("You can't set the number format of cells in a typed column") and format by themselves.
+    if (!have) { try { sh.getRange(row, 1, 1, 1).setNumberFormat("m/d/yyyy"); sh.getRange(row, 2, 1, 1).setNumberFormat("$#,##0.00"); } catch (e) { /* typed column */ } }
     (have ? result.updated : result.added).push(id);
   });
   deletes.sort(function (a, b) { return b - a; }).forEach(function (r) { sh.deleteRow(r); });
