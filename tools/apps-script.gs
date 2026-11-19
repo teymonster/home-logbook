@@ -1,5 +1,5 @@
 /**
- * Home Logbook — Google Apps Script web app (v17).
+ * Home Logbook — Google Apps Script web app (v18).
  *
  * Bound to the "Home Logbook progress" Sheet. Tabs, created on first use:
  *   log          id | last | history | updated | deleted                    (task tick-offs)
@@ -9,6 +9,7 @@
  *                (account = the provider's account number, shown on the app's Utilities tab; it was
  *                added after deleted so existing rows keep their layout, and sheet() fills in the header)
  *   payments     id | billId | date | amount | source | gmailId | subject | updated | deleted
+ *   checks       id | task | date | note | updated | deleted    (v18: one dated note per checklist-task tick; id = task:date)
  *   transactions id | date | merchant | amount | account | category | suggested | tag | note | detail |
  *                billId | source | csv | gmailId | updated | deleted     (budget: every charge)
  *   receipts     id | kind | date | merchant | total | orderId | categories | items | last4 |
@@ -46,7 +47,7 @@
  * typo in the Sheet can never cause rows to be dropped.
  */
 
-var VERSION = 17;
+var VERSION = 18;
 var CADENCES = ["weekly", "monthly", "bimonthly", "quarterly", "semiannual", "annual"];
 var SCAN_DAYS = 40;             // default look-back for the daily / on-demand scan
 var SCAN_MIN_GAP_MS = 5 * 60 * 1000;
@@ -89,9 +90,13 @@ var COLLECTIONS = {
   inventory: {
     header: ["id", "item", "room", "cost", "date", "files", "notes", "updated", "deleted", "brand", "model", "serial", "store", "manual", "warranty"],
     fromRow: invFromRow, toRow: invToRow, normalize: normalizeInv
+  },
+  checks: {
+    header: ["id", "task", "date", "note", "updated", "deleted"],
+    fromRow: checkFromRow, toRow: checkToRow, normalize: normalizeCheck, order: byDateDesc
   }
 };
-var NAMES = ["log", "bills", "payments", "docs", "inventory"]; // the app's sync set; a client writes only what it sends
+var NAMES = ["log", "bills", "payments", "docs", "inventory", "checks"]; // the app's sync set; a client writes only what it sends
 var BUDGET_NAMES = ["transactions", "receipts", "budget"]; // read with &budget=1, written when sent
 var TAGS = ["necessary", "unnecessary", "frivolous", "skip"];
 var ACCOUNTS = ["chase", "usaa"];
@@ -342,6 +347,30 @@ function normalizeLog(v) {
   if (hist.indexOf(v.last) < 0) hist.push(v.last);
   hist = uniq(hist).sort().slice(-12);
   return { last: hist[hist.length - 1], history: hist, u: isoOf(v.u) || (v.last + "T00:00:00Z") };
+}
+
+/* ------------------------------------------------------------------ checks */
+
+function checkFromRow(r, ctx) {
+  var id = s(r[0]);
+  if (!id) return null;
+  var updated = isoOf(r[4]) || ctx.now;
+  if (s(r[5]).toUpperCase() === "TRUE") return [id, { del: true, u: updated }];
+  var v = normalizeCheck({ task: s(r[1]), date: dateStr(r[2]), note: s(r[3]), u: updated });
+  if (!v) { ctx.unreadable.push(id); return null; }
+  return [id, v];
+}
+function checkToRow(id, v) {
+  if (v.del) return [id, "", "", "", v.u || "", "TRUE"];
+  return [id, v.task, v.date, v.note || "", v.u || "", ""];
+}
+function normalizeCheck(v) {
+  if (!v || typeof v !== "object") return null;
+  var now = new Date().toISOString();
+  if (v.del) return { del: true, u: isoOf(v.u) || now };
+  var task = s(v.task), date = s(v.date);
+  if (!task || !isDate(date)) return null;
+  return { task: task.slice(0, 60), date: date, note: s(v.note).slice(0, 2000), u: isoOf(v.u) || now };
 }
 
 /* ------------------------------------------------------------------ bills */
